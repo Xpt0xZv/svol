@@ -1,0 +1,35 @@
+# Secrets & keys
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*credentials*.json
+*secret*
+
+# IDEs, OS & local tooling
+.agents/
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Rust, Fuzzing & Python/Maturin builds
+/target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+dist/
+build/
+*.egg-info/
+*.whl
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
