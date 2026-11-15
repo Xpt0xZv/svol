@@ -8,7 +8,7 @@
 
 - [ ] `src/lexer.rs` — Core single-pass streaming XML 1.0 + Namespaces lexer / SIMD byte scanners
 - [ ] `src/lib.rs` — Public library API, formatter, `BoundedVecRefSink`, or safe filesystem I/O
-- [ ] `src/error.rs` — Diagnostic error codes (`E001`–`E026`), JSON serializer, terminal sanitizer, or UTF-16 offset mapping
+- [ ] `src/error.rs` — Diagnostic error codes (`E001`–`E035`), JSON serializer, terminal sanitizer, or UTF-16 offset mapping
 - [ ] `src/lsp.rs` — Language Server (`Content-Length` framing, document store, diagnostics, formatting)
 - [ ] `src/main.rs` — CLI argument parser, bounded non-recursive directory walker, or worker pool
 - [ ] `tests/` — Unit, CLI/LSP integration (`tests/cli_and_lsp_integration.rs`), or adversarial security tests (`tests/security_adversarial.rs`)

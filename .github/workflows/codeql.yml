@@ -38,9 +38,7 @@ jobs:
         uses: github/codeql-action/init@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
         with:
           languages: rust
-
-      - name: Autobuild Rust workspace
-        uses: github/codeql-action/autobuild@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
+          build-mode: none
 
       - name: Perform CodeQL Analysis (Rust)
         uses: github/codeql-action/analyze@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
