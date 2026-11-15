@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io;
 
 /// Severity level for a diagnostic emitted by `svol`.
@@ -198,19 +198,16 @@ impl XmlError {
             push_json_escaped(&mut out, path);
             out.push_str("\",");
         }
-        out.push_str("\"code\":\"");
-        out.push_str(self.code());
-        out.push_str("\",\"severity\":\"");
-        out.push_str(self.severity.as_str());
-        out.push_str("\",\"line\":");
-        out.push_str(&self.line.to_string());
-        out.push_str(",\"column\":");
-        out.push_str(&self.column.to_string());
-        out.push_str(",\"byte_offset\":");
-        out.push_str(&self.byte_offset.to_string());
-        out.push_str(",\"end_offset\":");
-        out.push_str(&self.end_offset.to_string());
-        out.push_str(",\"message\":\"");
+        let _ = write!(
+            out,
+            "\"code\":\"{}\",\"severity\":\"{}\",\"line\":{},\"column\":{},\"byte_offset\":{},\"end_offset\":{},\"message\":\"",
+            self.code(),
+            self.severity.as_str(),
+            self.line,
+            self.column,
+            self.byte_offset,
+            self.end_offset
+        );
         push_json_escaped(&mut out, &self.message);
         out.push_str("\"}");
         out
@@ -219,16 +216,26 @@ impl XmlError {
 
 impl fmt::Display for XmlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let safe_msg = sanitize_for_terminal(&self.message);
         write!(
             f,
-            "{}:{}: {} [{}]: {}",
+            "{}:{}: {} [{}]: ",
             self.line,
             self.column,
             self.severity,
-            self.code(),
-            safe_msg
-        )
+            self.code()
+        )?;
+        if !self.message.chars().any(is_unsafe_terminal_char) {
+            f.write_str(&self.message)
+        } else {
+            for ch in self.message.chars() {
+                if is_unsafe_terminal_char(ch) {
+                    f.write_str("\u{FFFD}")?;
+                } else {
+                    f.write_char(ch)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -254,6 +261,9 @@ pub const fn is_unsafe_terminal_char(ch: char) -> bool {
 /// escape injection (CWE-150) and Trojan Source BiDi spoofing (CWE-451) while preserving
 /// 1:1 character alignment.
 pub fn sanitize_for_terminal(s: &str) -> String {
+    if !s.chars().any(is_unsafe_terminal_char) {
+        return s.to_owned();
+    }
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if is_unsafe_terminal_char(ch) {
@@ -298,73 +308,171 @@ pub fn push_json_escaped(out: &mut String, s: &str) {
 
 const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
 
+/// Stateful, zero-allocation cursor that tracks line starts monotonically across `input`
+/// to avoid O(D * N) full-buffer rescans from byte 0 when computing 1-based `(line, col)`
+/// or 0-based LSP `(line, utf16_col)` coordinates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LineColCursor {
+    scan_pos: usize,
+    line_start: usize,
+    line_zero_based: usize,
+}
+
+impl LineColCursor {
+    /// Creates a new cursor positioned at byte 0, line 0.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            scan_pos: 0,
+            line_start: 0,
+            line_zero_based: 0,
+        }
+    }
+
+    /// Resets the cursor back to byte 0, line 0.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.scan_pos = 0;
+        self.line_start = 0;
+        self.line_zero_based = 0;
+    }
+
+    fn advance_to(&mut self, input: &[u8], clamped: usize) {
+        if clamped < self.line_start || self.scan_pos > input.len() {
+            self.reset();
+        }
+        if clamped < self.scan_pos {
+            return;
+        }
+        let mut i = self.scan_pos;
+        while i < clamped {
+            if input[i] == b'\n' {
+                self.line_zero_based += 1;
+                self.line_start = i + 1;
+            } else if input[i] == b'\r' {
+                if i + 1 < input.len() && input[i + 1] == b'\n' {
+                    if i + 1 < clamped {
+                        i += 1;
+                        self.line_zero_based += 1;
+                        self.line_start = i + 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    self.line_zero_based += 1;
+                    self.line_start = i + 1;
+                }
+            }
+            i += 1;
+        }
+        self.scan_pos = i;
+    }
+
+    /// Computes 1-based `(line, column)` (in Unicode scalar values) at `byte_offset` in `input`.
+    pub fn line_col_at(&mut self, input: &[u8], byte_offset: usize) -> (usize, usize) {
+        let clamped = byte_offset.min(input.len());
+        self.advance_to(input, clamped);
+        let slice = &input[self.line_start..clamped];
+        let col = match std::str::from_utf8(slice) {
+            Ok(s) => s.chars().count() + 1,
+            Err(_) => (clamped - self.line_start) + 1,
+        };
+        (self.line_zero_based + 1, col)
+    }
+
+    /// Converts a byte offset in `input` to 0-based `(line, utf16_col)` per the LSP specification
+    /// (Ruling 3, CWE-125). Each Unicode scalar on the target line contributes `ch.len_utf16()`.
+    pub fn byte_offset_to_utf16_line_col(
+        &mut self,
+        input: &[u8],
+        byte_offset: usize,
+    ) -> (usize, usize) {
+        let clamped = byte_offset.min(input.len());
+        self.advance_to(input, clamped);
+        let slice = &input[self.line_start..clamped];
+        let utf16_col = match std::str::from_utf8(slice) {
+            Ok(s) => s.chars().map(|ch| ch.len_utf16()).sum(),
+            Err(_) => clamped - self.line_start,
+        };
+        (self.line_zero_based, utf16_col)
+    }
+}
+
 /// Computes 1-based `(line, column)` (in Unicode scalar values) at `byte_offset` in `input`.
 pub fn line_col_at(input: &[u8], byte_offset: usize) -> (usize, usize) {
-    let clamped = byte_offset.min(input.len());
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < clamped {
-        if input[i] == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        } else if input[i] == b'\r' {
-            if i + 1 < input.len() && input[i + 1] == b'\n' {
-                if i + 1 < clamped {
-                    i += 1;
-                    line += 1;
-                    line_start = i + 1;
-                } else {
-                    break;
-                }
-            } else {
-                line += 1;
-                line_start = i + 1;
-            }
-        }
-        i += 1;
-    }
-    let slice = &input[line_start..clamped];
-    let col = match std::str::from_utf8(slice) {
-        Ok(s) => s.chars().count() + 1,
-        Err(_) => (clamped - line_start) + 1,
-    };
-    (line, col)
+    LineColCursor::new().line_col_at(input, byte_offset)
 }
 
 /// Converts a byte offset in `input` to 0-based `(line, utf16_col)` per the LSP specification
 /// (Ruling 3, CWE-125). Each Unicode scalar on the target line contributes `ch.len_utf16()`.
 pub fn byte_offset_to_utf16_line_col(input: &[u8], byte_offset: usize) -> (usize, usize) {
-    let clamped = byte_offset.min(input.len());
-    let mut line = 0usize;
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < clamped {
-        if input[i] == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        } else if input[i] == b'\r' {
-            if i + 1 < input.len() && input[i + 1] == b'\n' {
-                if i + 1 < clamped {
-                    i += 1;
-                    line += 1;
-                    line_start = i + 1;
-                } else {
-                    break;
-                }
-            } else {
-                line += 1;
-                line_start = i + 1;
-            }
+    LineColCursor::new().byte_offset_to_utf16_line_col(input, byte_offset)
+}
+
+fn advance_to_line(
+    bytes: &[u8],
+    cur_line: &mut usize,
+    line_start: &mut usize,
+    i: &mut usize,
+    target_line: usize,
+) -> Option<()> {
+    let len = bytes.len();
+    while *cur_line < target_line {
+        if *i >= len {
+            return None;
         }
-        i += 1;
+        if bytes[*i] == b'\n' {
+            *cur_line += 1;
+            *line_start = *i + 1;
+        } else if bytes[*i] == b'\r' {
+            if *i + 1 < len && bytes[*i + 1] == b'\n' {
+                *i += 1;
+            }
+            *cur_line += 1;
+            *line_start = *i + 1;
+        }
+        *i += 1;
     }
-    let slice = &input[line_start..clamped];
-    let utf16_col = match std::str::from_utf8(slice) {
-        Ok(s) => s.chars().map(|ch| ch.len_utf16()).sum(),
-        Err(_) => clamped - line_start,
-    };
-    (line, utf16_col)
+    Some(())
+}
+
+fn find_line_end(bytes: &[u8], line_start: usize) -> usize {
+    let len = bytes.len();
+    let mut line_end = line_start;
+    while line_end < len && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
+        line_end += 1;
+    }
+    line_end
+}
+
+fn resolve_utf16_col_on_slice(
+    slice: &str,
+    base_offset: usize,
+    init_col: usize,
+    target_col: usize,
+) -> Option<usize> {
+    if target_col == init_col {
+        return Some(base_offset);
+    }
+    if target_col < init_col {
+        return None;
+    }
+    let mut utf16_col = init_col;
+    for (rel_byte, ch) in slice.char_indices() {
+        if utf16_col == target_col {
+            return Some(base_offset + rel_byte);
+        }
+        if utf16_col > target_col {
+            // Landed inside a surrogate pair!
+            return None;
+        }
+        utf16_col += ch.len_utf16();
+    }
+    if utf16_col == target_col {
+        Some(base_offset + slice.len())
+    } else {
+        None
+    }
 }
 
 /// Converts a 0-based LSP `(line, character_utf16)` coordinate into a validated byte offset in `doc`.
@@ -376,54 +484,56 @@ pub fn utf16_position_to_byte_offset(
     character_utf16: usize,
 ) -> Option<usize> {
     let bytes = doc.as_bytes();
-    let len = bytes.len();
     let mut cur_line = 0usize;
     let mut line_start = 0usize;
     let mut i = 0usize;
 
-    while cur_line < line {
-        if i >= len {
-            return None;
-        }
-        if bytes[i] == b'\n' {
-            cur_line += 1;
-            line_start = i + 1;
-        } else if bytes[i] == b'\r' {
-            if i + 1 < len && bytes[i + 1] == b'\n' {
-                i += 1;
-            }
-            cur_line += 1;
-            line_start = i + 1;
-        }
-        i += 1;
+    advance_to_line(bytes, &mut cur_line, &mut line_start, &mut i, line)?;
+    let line_end = find_line_end(bytes, line_start);
+    resolve_utf16_col_on_slice(&doc[line_start..line_end], line_start, 0, character_utf16)
+}
+
+/// Resolves a 0-based LSP UTF-16 range `(start, end)` into validated byte offsets `(start_byte, end_byte)`
+/// in a single forward scan of `doc` when `start <= end`. Returns `None` if either position is out of
+/// bounds, splits a UTF-16 surrogate pair, or if `start_byte > end_byte`.
+pub fn utf16_range_to_byte_offsets(
+    doc: &str,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Option<(usize, usize)> {
+    if end.0 < start.0 || (end.0 == start.0 && end.1 < start.1) {
+        return None;
     }
 
-    // Find end of target line (before \r or \n)
-    let mut line_end = line_start;
-    while line_end < len && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
-        line_end += 1;
+    let bytes = doc.as_bytes();
+    let mut cur_line = 0usize;
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+
+    advance_to_line(bytes, &mut cur_line, &mut line_start, &mut i, start.0)?;
+    let line_end = find_line_end(bytes, line_start);
+    let start_byte =
+        resolve_utf16_col_on_slice(&doc[line_start..line_end], line_start, 0, start.1)?;
+
+    if end.0 == start.0 {
+        let end_byte =
+            resolve_utf16_col_on_slice(&doc[start_byte..line_end], start_byte, start.1, end.1)?;
+        return if start_byte > end_byte {
+            None
+        } else {
+            Some((start_byte, end_byte))
+        };
     }
 
-    let line_str = &doc[line_start..line_end];
-    if character_utf16 == 0 {
-        return Some(line_start);
-    }
+    i = line_end;
+    advance_to_line(bytes, &mut cur_line, &mut line_start, &mut i, end.0)?;
+    let end_line_end = find_line_end(bytes, line_start);
+    let end_byte =
+        resolve_utf16_col_on_slice(&doc[line_start..end_line_end], line_start, 0, end.1)?;
 
-    let mut utf16_col = 0usize;
-    for (rel_byte, ch) in line_str.char_indices() {
-        if utf16_col == character_utf16 {
-            return Some(line_start + rel_byte);
-        }
-        if utf16_col > character_utf16 {
-            // Landed inside a surrogate pair!
-            return None;
-        }
-        utf16_col += ch.len_utf16();
-    }
-
-    if utf16_col == character_utf16 {
-        Some(line_end)
-    } else {
+    if start_byte > end_byte {
         None
+    } else {
+        Some((start_byte, end_byte))
     }
 }

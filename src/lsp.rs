@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 use crate::error::{
-    byte_offset_to_utf16_line_col, push_json_escaped, utf16_position_to_byte_offset, XmlError,
-    XmlErrorKind,
+    byte_offset_to_utf16_line_col, push_json_escaped, utf16_range_to_byte_offsets, LineColCursor,
+    XmlError, XmlErrorKind,
 };
 use crate::{format_xml, lint_xml, Config, DEFAULT_MAX_INPUT_BYTES};
 
@@ -122,48 +123,53 @@ impl LspServer {
                                 self.documents.remove(&first_key);
                             }
                         }
-                        self.documents.insert(uri.clone(), text.clone());
                         self.publish_diagnostics(&uri, text.as_bytes(), writer)?;
+                        if !self
+                            .documents
+                            .get(&uri)
+                            .is_some_and(|existing| existing == &text)
+                        {
+                            self.documents.insert(uri, text);
+                        }
                     }
                 }
             }
             Some("textDocument/didChange") => {
                 if let Some((uri, changes)) = extract_did_change_params(payload) {
+                    if changes.is_empty() {
+                        return Ok(Some(false));
+                    }
                     let max_in = self.config.max_input_bytes.min(DEFAULT_MAX_INPUT_BYTES);
-                    let mut has_base = self.documents.contains_key(&uri);
-                    let mut doc = self.documents.get(&uri).cloned().unwrap_or_default();
-                    let mut evicted = false;
-                    let mut invalid_range = false;
-
-                    for change in changes {
+                    if changes.len() == 1 {
+                        let change = changes.into_iter().next().unwrap();
                         if let Some(((sl, sc), (el, ec))) = change.range {
-                            if !has_base {
-                                invalid_range = true;
-                                break;
-                            }
-                            let Some(start_byte) = utf16_position_to_byte_offset(&doc, sl, sc)
+                            let Some(existing) = self.documents.get(&uri) else {
+                                return Ok(Some(false));
+                            };
+                            let Some((start_byte, end_byte)) =
+                                utf16_range_to_byte_offsets(existing, (sl, sc), (el, ec))
                             else {
-                                invalid_range = true;
-                                break;
+                                return Ok(Some(false));
                             };
-                            let Some(end_byte) = utf16_position_to_byte_offset(&doc, el, ec) else {
-                                invalid_range = true;
-                                break;
-                            };
-                            if start_byte > end_byte {
-                                invalid_range = true;
-                                break;
-                            }
                             let removed_len = end_byte - start_byte;
                             let new_len =
-                                (doc.len() - removed_len).saturating_add(change.text.len());
+                                (existing.len() - removed_len).saturating_add(change.text.len());
                             if new_len > max_in {
                                 self.documents.remove(&uri);
                                 self.publish_oversized_diagnostic(&uri, new_len, max_in, writer)?;
-                                evicted = true;
-                                break;
+                                return Ok(Some(false));
                             }
+                            if &existing[start_byte..end_byte] == change.text.as_str() {
+                                return Ok(Some(false));
+                            }
+                            let doc = self.documents.get_mut(&uri).expect("checked above");
                             doc.replace_range(start_byte..end_byte, &change.text);
+                            publish_diagnostics_with_config(
+                                &self.config,
+                                &uri,
+                                doc.as_bytes(),
+                                writer,
+                            )?;
                         } else {
                             if change.text.len() > max_in {
                                 self.documents.remove(&uri);
@@ -173,24 +179,90 @@ impl LspServer {
                                     max_in,
                                     writer,
                                 )?;
-                                evicted = true;
-                                break;
+                                return Ok(Some(false));
                             }
-                            doc = change.text;
-                            has_base = true;
+                            if self
+                                .documents
+                                .get(&uri)
+                                .is_some_and(|existing| existing == &change.text)
+                            {
+                                return Ok(Some(false));
+                            }
+                            if self.documents.len() >= MAX_OPEN_DOCUMENTS
+                                && !self.documents.contains_key(&uri)
+                            {
+                                if let Some(first_key) = self.documents.keys().next().cloned() {
+                                    self.documents.remove(&first_key);
+                                }
+                            }
+                            self.publish_diagnostics(&uri, change.text.as_bytes(), writer)?;
+                            self.documents.insert(uri, change.text);
                         }
-                    }
+                    } else {
+                        let mut has_base = self.documents.contains_key(&uri);
+                        let mut doc = self.documents.get(&uri).cloned().unwrap_or_default();
+                        let mut evicted = false;
+                        let mut invalid_range = false;
+                        let mut changed = false;
 
-                    if !evicted && !invalid_range && has_base {
-                        if self.documents.len() >= MAX_OPEN_DOCUMENTS
-                            && !self.documents.contains_key(&uri)
-                        {
-                            if let Some(first_key) = self.documents.keys().next().cloned() {
-                                self.documents.remove(&first_key);
+                        for change in changes {
+                            if let Some(((sl, sc), (el, ec))) = change.range {
+                                if !has_base {
+                                    invalid_range = true;
+                                    break;
+                                }
+                                let Some((start_byte, end_byte)) =
+                                    utf16_range_to_byte_offsets(&doc, (sl, sc), (el, ec))
+                                else {
+                                    invalid_range = true;
+                                    break;
+                                };
+                                let removed_len = end_byte - start_byte;
+                                let new_len =
+                                    (doc.len() - removed_len).saturating_add(change.text.len());
+                                if new_len > max_in {
+                                    self.documents.remove(&uri);
+                                    self.publish_oversized_diagnostic(
+                                        &uri, new_len, max_in, writer,
+                                    )?;
+                                    evicted = true;
+                                    break;
+                                }
+                                if &doc[start_byte..end_byte] != change.text.as_str() {
+                                    changed = true;
+                                    doc.replace_range(start_byte..end_byte, &change.text);
+                                }
+                            } else {
+                                if change.text.len() > max_in {
+                                    self.documents.remove(&uri);
+                                    self.publish_oversized_diagnostic(
+                                        &uri,
+                                        change.text.len(),
+                                        max_in,
+                                        writer,
+                                    )?;
+                                    evicted = true;
+                                    break;
+                                }
+                                if !has_base || doc != change.text {
+                                    changed = true;
+                                }
+                                doc = change.text;
+                                has_base = true;
                             }
                         }
-                        self.documents.insert(uri.clone(), doc.clone());
-                        self.publish_diagnostics(&uri, doc.as_bytes(), writer)?;
+
+                        if !evicted && !invalid_range && has_base && changed {
+                            if self.documents.len() >= MAX_OPEN_DOCUMENTS
+                                && !self.documents.contains_key(&uri)
+                            {
+                                if let Some(first_key) = self.documents.keys().next().cloned() {
+                                    self.documents.remove(&first_key);
+                                }
+                            }
+                            self.publish_diagnostics(&uri, doc.as_bytes(), writer)?;
+                            self.documents.insert(uri, doc);
+                        }
                     }
                 }
             }
@@ -207,21 +279,31 @@ impl LspServer {
                                     max_in,
                                     writer,
                                 )?;
-                            } else {
-                                self.documents.insert(uri.clone(), text.clone());
+                            } else if !self
+                                .documents
+                                .get(&uri)
+                                .is_some_and(|existing| existing == &text)
+                            {
+                                if self.documents.len() >= MAX_OPEN_DOCUMENTS
+                                    && !self.documents.contains_key(&uri)
+                                {
+                                    if let Some(first_key) = self.documents.keys().next().cloned() {
+                                        self.documents.remove(&first_key);
+                                    }
+                                }
                                 self.publish_diagnostics(&uri, text.as_bytes(), writer)?;
+                                self.documents.insert(uri, text);
                             }
-                        } else if let Some(existing) = self.documents.get(&uri).cloned() {
-                            if existing.len() > max_in {
+                        } else if let Some(existing_len) = self.documents.get(&uri).map(String::len)
+                        {
+                            if existing_len > max_in {
                                 self.documents.remove(&uri);
                                 self.publish_oversized_diagnostic(
                                     &uri,
-                                    existing.len(),
+                                    existing_len,
                                     max_in,
                                     writer,
                                 )?;
-                            } else {
-                                self.publish_diagnostics(&uri, existing.as_bytes(), writer)?;
                             }
                         }
                     }
@@ -264,17 +346,29 @@ impl LspServer {
                         if let Some(doc) = self.documents.get(&uri) {
                             match format_xml(doc.as_bytes(), &config) {
                                 Ok(formatted) => {
-                                    let formatted_str = String::from_utf8_lossy(&formatted);
-                                    let (end_line, end_utf16_col) =
-                                        byte_offset_to_utf16_line_col(doc.as_bytes(), doc.len());
-                                    let resp = format!(
-                                        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":{},\"character\":{}}}}},\"newText\":\"{}\"}}]}}",
-                                        id,
-                                        end_line,
-                                        end_utf16_col,
-                                        escape_json_str(&formatted_str)
-                                    );
-                                    write_lsp_message(writer, &resp)?;
+                                    if formatted == doc.as_bytes() {
+                                        let resp = format!(
+                                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":[]}}",
+                                            id
+                                        );
+                                        write_lsp_message(writer, &resp)?;
+                                    } else {
+                                        let formatted_str = String::from_utf8_lossy(&formatted);
+                                        let (end_line, end_utf16_col) =
+                                            byte_offset_to_utf16_line_col(
+                                                doc.as_bytes(),
+                                                doc.len(),
+                                            );
+                                        let mut resp = String::with_capacity(formatted.len() + 128);
+                                        let _ = write!(
+                                            resp,
+                                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":{},\"character\":{}}}}},\"newText\":\"",
+                                            id, end_line, end_utf16_col
+                                        );
+                                        push_json_escaped(&mut resp, &formatted_str);
+                                        resp.push_str("\"}]}");
+                                        write_lsp_message(writer, &resp)?;
+                                    }
                                 }
                                 Err(_) => {
                                     let resp = format!(
@@ -328,12 +422,15 @@ impl LspServer {
             1,
             1,
         );
-        let diag_json = format!("[{}]", format_lsp_diagnostic(b"", &err));
-        let notif = format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{}\",\"diagnostics\":{}}}}}",
-            escape_json_str(uri),
-            diag_json
+        let mut cursor = LineColCursor::new();
+        let mut notif = String::with_capacity(256);
+        notif.push_str(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"",
         );
+        push_json_escaped(&mut notif, uri);
+        notif.push_str("\",\"diagnostics\":[");
+        push_lsp_diagnostic(&mut notif, b"", &err, &mut cursor);
+        notif.push_str("]}}");
         write_lsp_message(writer, &notif)
     }
 
@@ -343,28 +440,37 @@ impl LspServer {
         content: &[u8],
         writer: &mut W,
     ) -> io::Result<()> {
-        let errors = lint_xml(content, &self.config);
-        let mut diag_json = String::from("[");
-        for (idx, err) in errors.iter().enumerate() {
-            if idx > 0 {
-                diag_json.push(',');
-            }
-            diag_json.push_str(&format_lsp_diagnostic(content, err));
-        }
-        diag_json.push(']');
-
-        let notif = format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{}\",\"diagnostics\":{}}}}}",
-            escape_json_str(uri),
-            diag_json
-        );
-        write_lsp_message(writer, &notif)
+        publish_diagnostics_with_config(&self.config, uri, content, writer)
     }
 }
 
-fn format_lsp_diagnostic(input: &[u8], err: &XmlError) -> String {
-    let (start_line, start_char) = byte_offset_to_utf16_line_col(input, err.byte_offset);
-    let (end_l, end_c) = byte_offset_to_utf16_line_col(input, err.end_offset);
+fn publish_diagnostics_with_config<W: Write>(
+    config: &Config,
+    uri: &str,
+    content: &[u8],
+    writer: &mut W,
+) -> io::Result<()> {
+    let errors = lint_xml(content, config);
+    let mut cursor = LineColCursor::new();
+    let mut notif = String::with_capacity(128 + errors.len() * 192);
+    notif.push_str(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"",
+    );
+    push_json_escaped(&mut notif, uri);
+    notif.push_str("\",\"diagnostics\":[");
+    for (idx, err) in errors.iter().enumerate() {
+        if idx > 0 {
+            notif.push(',');
+        }
+        push_lsp_diagnostic(&mut notif, content, err, &mut cursor);
+    }
+    notif.push_str("]}}");
+    write_lsp_message(writer, &notif)
+}
+
+fn push_lsp_diagnostic(out: &mut String, input: &[u8], err: &XmlError, cursor: &mut LineColCursor) {
+    let (start_line, start_char) = cursor.byte_offset_to_utf16_line_col(input, err.byte_offset);
+    let (end_l, end_c) = cursor.byte_offset_to_utf16_line_col(input, err.end_offset);
     let end_line = end_l.max(start_line);
     let end_char = if end_line == start_line {
         end_c.max(start_char + 1)
@@ -372,23 +478,18 @@ fn format_lsp_diagnostic(input: &[u8], err: &XmlError) -> String {
         end_c
     };
 
-    let mut out = String::with_capacity(192);
-    out.push_str("{\"range\":{\"start\":{\"line\":");
-    out.push_str(&start_line.to_string());
-    out.push_str(",\"character\":");
-    out.push_str(&start_char.to_string());
-    out.push_str("},\"end\":{\"line\":");
-    out.push_str(&end_line.to_string());
-    out.push_str(",\"character\":");
-    out.push_str(&end_char.to_string());
-    out.push_str("}},\"severity\":");
-    out.push_str(&err.severity.lsp_code().to_string());
-    out.push_str(",\"code\":\"");
-    out.push_str(err.code());
-    out.push_str("\",\"source\":\"svol\",\"message\":\"");
-    push_json_escaped(&mut out, &err.message);
+    let _ = write!(
+        out,
+        "{{\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}},\"severity\":{},\"code\":\"{}\",\"source\":\"svol\",\"message\":\"",
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+        err.severity.lsp_code(),
+        err.code()
+    );
+    push_json_escaped(out, &err.message);
     out.push_str("\"}");
-    out
 }
 
 /// Hardened `Content-Length` framed LSP reader (CWE-444 / CWE-400):
@@ -485,21 +586,25 @@ pub fn read_lsp_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> 
         ));
     };
 
-    // Cap initial allocation at 64 KiB and read in chunks to prevent pre-allocation OOM
+    // Cap initial allocation at 64 KiB and read directly from BufRead buffer to avoid double-copy
     let mut buf = Vec::with_capacity(len.min(64 * 1024));
     let mut remaining = len;
-    let mut chunk = [0u8; 16 * 1024];
     while remaining > 0 {
-        let to_read = remaining.min(chunk.len());
-        let n = reader.read(&mut chunk[..to_read])?;
-        if n == 0 {
+        let available = match reader.fill_buf() {
+            Ok(avail) => avail,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected EOF while reading LSP message body",
             ));
         }
-        buf.extend_from_slice(&chunk[..n]);
-        remaining -= n;
+        let to_take = available.len().min(remaining);
+        buf.extend_from_slice(&available[..to_take]);
+        reader.consume(to_take);
+        remaining -= to_take;
     }
 
     String::from_utf8(buf)
@@ -617,7 +722,12 @@ pub fn find_json_object_field_value<'a>(json_obj: &'a str, target_key: &str) -> 
             return None;
         }
         let key_end = skip_json_string(trimmed, i)?;
-        let key_parsed = parse_json_string_literal(&trimmed[i..key_end])?;
+        let raw_key_inner = &trimmed[i + 1..key_end - 1];
+        let key_matches = if !raw_key_inner.as_bytes().contains(&b'\\') {
+            raw_key_inner == target_key
+        } else {
+            parse_json_string_literal(&trimmed[i..key_end])? == target_key
+        };
         i = key_end;
 
         while i < len && bytes[i].is_ascii_whitespace() {
@@ -636,7 +746,7 @@ pub fn find_json_object_field_value<'a>(json_obj: &'a str, target_key: &str) -> 
 
         let val_start = i;
         let val_end = skip_json_value(trimmed, val_start)?;
-        if key_parsed == target_key {
+        if key_matches {
             return Some(&trimmed[val_start..val_end]);
         }
         i = val_end;
@@ -768,7 +878,7 @@ pub fn parse_json_string_literal(s: &str) -> Option<String> {
     if bytes.first().copied() != Some(b'"') {
         return None;
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(trimmed.len().saturating_sub(2).min(64 * 1024));
     let mut chars = trimmed[1..].chars();
     while let Some(ch) = chars.next() {
         if ch == '"' {

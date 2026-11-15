@@ -12,11 +12,13 @@ use std::time::SystemTime;
 
 pub use error::{
     byte_offset_to_utf16_line_col, line_col_at, push_json_escaped, sanitize_for_terminal,
-    utf16_position_to_byte_offset, Severity, XmlError, XmlErrorKind,
+    utf16_position_to_byte_offset, utf16_range_to_byte_offsets, LineColCursor, Severity, XmlError,
+    XmlErrorKind,
 };
 pub use lexer::{
     is_name_char, is_name_start_char, is_xml_char, skip_xml_attr_bytes, skip_xml_text_bytes,
-    BoundedVecRefSink, FxBuildHasher, FxHasher, KeySet, RawKeySet, StreamingEngine, XmlFrame,
+    BoundedVecRefSink, EngineScratch, FxBuildHasher, FxHasher, KeySet, RawKeySet, StreamingEngine,
+    XmlFrame,
 };
 
 /// Hard resource bound: 100 MiB maximum input buffer size.
@@ -110,6 +112,17 @@ pub fn lint_xml(input: &[u8], config: &Config) -> Vec<XmlError> {
     diagnostics
 }
 
+/// Validates `input` in a single streaming pass reusing `scratch` to eliminate per-file
+/// diagnostic vector reallocations in multi-file workers.
+pub fn lint_xml_with_scratch(
+    input: &[u8],
+    config: &Config,
+    scratch: &mut EngineScratch,
+) -> Vec<XmlError> {
+    StreamingEngine::run_with_scratch(input, config, false, scratch);
+    std::mem::take(&mut scratch.diagnostics)
+}
+
 /// Validates and formats `input` in a single streaming pass without constructing a DOM.
 /// Returns the formatted UTF-8 byte buffer or a list of diagnostics if ill-formed.
 ///
@@ -140,6 +153,20 @@ pub fn format_xml(input: &[u8], config: &Config) -> Result<Vec<u8>, Vec<XmlError
     }
 }
 
+/// Validates and formats `input` in a single streaming pass reusing `scratch` to avoid
+/// per-file output buffer reallocations.
+pub fn format_xml_with_scratch<'a>(
+    input: &[u8],
+    config: &Config,
+    scratch: &'a mut EngineScratch,
+) -> Result<&'a [u8], Vec<XmlError>> {
+    if StreamingEngine::run_with_scratch(input, config, true, scratch) {
+        Ok(&scratch.output_buf)
+    } else {
+        Err(std::mem::take(&mut scratch.diagnostics))
+    }
+}
+
 /// Returns `true` if `path` has a supported XML family extension
 /// (`.xml`, `.xsd`, `.xsl`, `.xslt`, `.svg`, `.plist`, `.xhtml`, `.csproj`, `.pom`).
 ///
@@ -165,6 +192,24 @@ pub fn is_supported_xml_path(path: &Path) -> bool {
 /// Reads a regular file up to `max_bytes`, rejecting symlinks, FIFOs/devices/directories,
 /// and oversized files without allocating beyond the limit (CWE-59 / CWE-367).
 pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, XmlError> {
+    let mut buf = Vec::new();
+    read_file_bounded_into(path, max_bytes, &mut buf)?;
+    Ok(buf)
+}
+
+/// Reads a regular file up to `max_bytes` into a reusable buffer `buf`, rejecting symlinks,
+/// FIFOs/devices/directories, and oversized files (CWE-59 / CWE-367).
+pub fn read_file_bounded_into(
+    path: &Path,
+    max_bytes: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), XmlError> {
+    const MAX_RETAINED_BUF_BYTES: usize = 4 * 1024 * 1024;
+    buf.clear();
+    if buf.capacity() > MAX_RETAINED_BUF_BYTES {
+        buf.shrink_to(MAX_RETAINED_BUF_BYTES);
+    }
+
     let sym_meta = fs::symlink_metadata(path).map_err(|e| XmlError::io(&e))?;
     if sym_meta.file_type().is_symlink() {
         return Err(XmlError::io(&io::Error::new(
@@ -201,24 +246,27 @@ pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, XmlEr
         ));
     }
     let cap = (meta.len() as usize).min(max_bytes).min(64 * 1024);
-    let mut buf = Vec::with_capacity(cap);
+    if buf.capacity() < cap {
+        buf.reserve(cap);
+    }
     file.take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut buf)
+        .read_to_end(buf)
         .map_err(|e| XmlError::io(&e))?;
     if buf.len() > max_bytes {
+        let len = buf.len();
+        buf.clear();
         return Err(XmlError::new(
             XmlErrorKind::InputTooLarge,
             format!(
                 "file size ({} bytes) exceeds maximum limit of {} bytes",
-                buf.len(),
-                max_bytes
+                len, max_bytes
             ),
             0,
             1,
             1,
         ));
     }
-    Ok(buf)
+    Ok(())
 }
 
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);

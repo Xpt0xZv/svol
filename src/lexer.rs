@@ -3,13 +3,14 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::error::{line_col_at, XmlError, XmlErrorKind};
+use crate::error::{LineColCursor, XmlError, XmlErrorKind};
 use crate::{
     Config, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, MAX_DEPTH, MAX_LINT_DIAGNOSTICS,
 };
 
 const XML_NS_URI: &[u8] = b"http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS_URI: &[u8] = b"http://www.w3.org/2000/xmlns/";
+const XML_NS_COW: Cow<'static, [u8]> = Cow::Borrowed(XML_NS_URI);
 
 /// Bounded output byte sink that strictly enforces `max_bytes` before copying and caps
 /// underlying `Vec<u8>` capacity at `max_bytes` using `try_reserve_exact` (CWE-400).
@@ -21,6 +22,9 @@ pub struct BoundedVecRefSink<'a> {
 impl<'a> BoundedVecRefSink<'a> {
     #[inline]
     pub fn new(buf: &'a mut Vec<u8>, max_bytes: usize) -> Self {
+        if buf.capacity() > max_bytes {
+            buf.shrink_to(max_bytes);
+        }
         Self { buf, max_bytes }
     }
 
@@ -162,7 +166,7 @@ impl<K: Eq + Hash + Clone> Default for KeySet<K> {
 impl<K: Eq + Hash + Clone> KeySet<K> {
     #[inline]
     pub fn new() -> Self {
-        KeySet::Tier1Vec(Vec::with_capacity(8))
+        KeySet::Tier1Vec(Vec::new())
     }
 
     #[inline]
@@ -175,7 +179,7 @@ impl<K: Eq + Hash + Clone> KeySet<K> {
                 }
             }
             KeySet::Tier2Fx(_) | KeySet::Tier3Sip(_) => {
-                *self = KeySet::Tier1Vec(Vec::with_capacity(8));
+                *self = KeySet::Tier1Vec(Vec::new());
             }
         }
     }
@@ -221,6 +225,9 @@ impl<K: Eq + Hash + Clone> KeySet<K> {
                     return false;
                 }
                 if vec.len() < 8 {
+                    if vec.capacity() == 0 {
+                        vec.reserve_exact(8);
+                    }
                     vec.push(key);
                     return true;
                 }
@@ -1094,6 +1101,21 @@ fn starts_with_keyword_ci(bytes: &[u8], kw: &[u8]) -> bool {
     is_xml_space(next) || matches!(next, b'"' | b'\'' | b'>' | b'[')
 }
 
+/// Reusable scratch buffers for multi-file lint and format execution without per-file heap reallocations.
+#[derive(Debug, Default)]
+pub struct EngineScratch {
+    pub(crate) output_buf: Vec<u8>,
+    pub(crate) diagnostics: Vec<XmlError>,
+}
+
+impl EngineScratch {
+    /// Creates an empty `EngineScratch` with zero initial heap allocations.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Single-pass streaming XML 1.0 (Fifth Edition) + Namespaces in XML 1.0 engine.
 pub struct StreamingEngine<'a> {
     input: &'a [u8],
@@ -1103,6 +1125,8 @@ pub struct StreamingEngine<'a> {
     diagnostics: Vec<XmlError>,
     raw_attr_set: RawKeySet<'a>,
     expanded_attr_set: KeySet<(Cow<'a, [u8]>, &'a [u8])>,
+    attrs_scratch: Vec<BufferedAttr<'a>>,
+    line_cursor: LineColCursor,
     out: Option<Vec<u8>>,
     seen_root: bool,
     root_closed: bool,
@@ -1126,6 +1150,8 @@ impl<'a> StreamingEngine<'a> {
             diagnostics: Vec::new(),
             raw_attr_set: RawKeySet::new(),
             expanded_attr_set: KeySet::new(),
+            attrs_scratch: Vec::new(),
+            line_cursor: LineColCursor::new(),
             out,
             seen_root: false,
             root_closed: false,
@@ -1133,9 +1159,64 @@ impl<'a> StreamingEngine<'a> {
         }
     }
 
+    /// Runs the single-pass engine reusing pre-allocated buffers in `scratch`.
+    /// Returns `true` when validation/formatting succeeded with zero diagnostics.
+    pub fn run_with_scratch(
+        input: &'a [u8],
+        config: &'a Config,
+        build_output: bool,
+        scratch: &mut EngineScratch,
+    ) -> bool {
+        const MAX_RETAINED_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+        scratch.diagnostics.clear();
+        scratch.output_buf.clear();
+        if scratch.output_buf.capacity() > MAX_RETAINED_SCRATCH_BYTES {
+            scratch.output_buf.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
+        }
+
+        let max_out = config.max_output_bytes.min(DEFAULT_MAX_OUTPUT_BYTES);
+        let out = if build_output {
+            let mut buf = std::mem::take(&mut scratch.output_buf);
+            if buf.capacity() > max_out {
+                buf.shrink_to(max_out);
+            }
+            let target_cap = input.len().min(max_out).min(64 * 1024);
+            if buf.capacity() < target_cap {
+                let _ = buf.try_reserve(target_cap - buf.capacity());
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
+        let mut engine = Self {
+            input,
+            config,
+            pos: 0,
+            stack: Vec::with_capacity(32),
+            diagnostics: std::mem::take(&mut scratch.diagnostics),
+            raw_attr_set: RawKeySet::new(),
+            expanded_attr_set: KeySet::new(),
+            attrs_scratch: Vec::new(),
+            line_cursor: LineColCursor::new(),
+            out,
+            seen_root: false,
+            root_closed: false,
+            seen_doctype: false,
+        };
+
+        engine.execute();
+
+        scratch.diagnostics = engine.diagnostics;
+        if let Some(buf) = engine.out {
+            scratch.output_buf = buf;
+        }
+        scratch.diagnostics.is_empty()
+    }
+
     fn emit_error(&mut self, kind: XmlErrorKind, msg: impl Into<String>, offset: usize) {
         if self.diagnostics.len() < self.config.max_diagnostics.min(MAX_LINT_DIAGNOSTICS) {
-            let (line, col) = line_col_at(self.input, offset);
+            let (line, col) = self.line_cursor.line_col_at(self.input, offset);
             self.diagnostics
                 .push(XmlError::new(kind, msg, offset, line, col));
         }
@@ -1149,7 +1230,7 @@ impl<'a> StreamingEngine<'a> {
         end_offset: usize,
     ) {
         if self.diagnostics.len() < self.config.max_diagnostics.min(MAX_LINT_DIAGNOSTICS) {
-            let (line, col) = line_col_at(self.input, start_offset);
+            let (line, col) = self.line_cursor.line_col_at(self.input, start_offset);
             self.diagnostics.push(XmlError::with_span(
                 kind,
                 msg,
@@ -1207,6 +1288,16 @@ impl<'a> StreamingEngine<'a> {
 
     /// Runs the single-pass streaming validation (and optional formatting).
     pub fn run(mut self) -> (Vec<XmlError>, Option<Vec<u8>>) {
+        self.execute();
+        let output = if self.diagnostics.is_empty() {
+            self.out
+        } else {
+            None
+        };
+        (self.diagnostics, output)
+    }
+
+    fn execute(&mut self) {
         let max_in = self.config.max_input_bytes.min(DEFAULT_MAX_INPUT_BYTES);
         if self.input.len() > max_in {
             self.emit_error(
@@ -1218,12 +1309,12 @@ impl<'a> StreamingEngine<'a> {
                 ),
                 0,
             );
-            return (self.diagnostics, None);
+            return;
         }
 
         // Step 1: Encoding & BOM Gate at Offset 0
         if !self.check_bom_and_encoding_gate() {
-            return (self.diagnostics, None);
+            return;
         }
 
         // Step 2: Optional XML Declaration at byte 0 (or byte 3 right after UTF-8 BOM)
@@ -1231,7 +1322,7 @@ impl<'a> StreamingEngine<'a> {
         if self.input[self.pos..].starts_with(b"<?")
             && !self.try_parse_initial_xml_decl(decl_allowed_pos)
         {
-            return (self.diagnostics, None);
+            return;
         }
 
         // Step 3: Main single-pass state machine
@@ -1252,12 +1343,18 @@ impl<'a> StreamingEngine<'a> {
         if self.diagnostics.is_empty() {
             if let Some(unclosed) = self.stack.pop() {
                 let name = String::from_utf8_lossy(unclosed.raw_name);
+                let (open_line, open_col) = if unclosed.open_line > 0 {
+                    (unclosed.open_line, unclosed.open_col)
+                } else {
+                    self.line_cursor
+                        .line_col_at(self.input, unclosed.open_offset)
+                };
                 self.diagnostics.push(XmlError::new(
                     XmlErrorKind::UnclosedElement,
                     format!("unclosed element '<{}>' at end of document", name),
                     unclosed.open_offset,
-                    unclosed.open_line,
-                    unclosed.open_col,
+                    open_line,
+                    open_col,
                 ));
             } else if !self.seen_root {
                 self.emit_error(
@@ -1273,13 +1370,6 @@ impl<'a> StreamingEngine<'a> {
                 let _ = self.write_bytes(b"\n", self.pos);
             }
         }
-
-        let output = if self.diagnostics.is_empty() {
-            self.out
-        } else {
-            None
-        };
-        (self.diagnostics, output)
     }
 
     fn check_bom_and_encoding_gate(&mut self) -> bool {
@@ -1777,6 +1867,11 @@ impl<'a> StreamingEngine<'a> {
         let mut i = start + 9; // after <![CDATA[
         let len = self.input.len();
         while i < len {
+            let fast = skip_xml_text_bytes(&self.input[i..]);
+            if fast > 0 {
+                i += fast;
+                continue;
+            }
             if self.input[i] == b']'
                 && i + 2 < len
                 && self.input[i + 1] == b']'
@@ -1784,6 +1879,11 @@ impl<'a> StreamingEngine<'a> {
             {
                 self.pos = i + 3;
                 return self.write_bytes(&self.input[start..self.pos], start);
+            }
+            let b = self.input[i];
+            if b == b'<' || b == b'&' || b == b'\r' || b == b']' {
+                i += 1;
+                continue;
             }
             let (cp, char_len) = match decode_utf8_at(self.input, i) {
                 Ok(v) => v,
@@ -2336,6 +2436,17 @@ impl<'a> StreamingEngine<'a> {
     }
 
     fn parse_start_or_empty_tag(&mut self) -> bool {
+        let mut attrs = std::mem::take(&mut self.attrs_scratch);
+        attrs.clear();
+        let ok = self.parse_start_or_empty_tag_with_attrs(&mut attrs);
+        if attrs.capacity() > 64 {
+            attrs.shrink_to(64);
+        }
+        self.attrs_scratch = attrs;
+        ok
+    }
+
+    fn parse_start_or_empty_tag_with_attrs(&mut self, attrs: &mut Vec<BufferedAttr<'a>>) -> bool {
         let tag_start = self.pos;
         if self.root_closed {
             self.emit_error(
@@ -2396,10 +2507,6 @@ impl<'a> StreamingEngine<'a> {
         if let Some(parent) = self.stack.last_mut() {
             parent.has_child_elements = true;
         }
-
-        // Buffer attributes on this tag
-        let mut attrs: Vec<BufferedAttr<'a>> = Vec::new();
-        self.raw_attr_set.clear();
 
         let mut i = name_end;
         let len = self.input.len();
@@ -2471,6 +2578,9 @@ impl<'a> StreamingEngine<'a> {
                 }
             };
 
+            if attrs.is_empty() {
+                self.raw_attr_set.clear();
+            }
             if !self.raw_attr_set.insert(attr_raw_name) {
                 self.emit_span_error(
                     XmlErrorKind::DuplicateAttribute,
@@ -2533,7 +2643,35 @@ impl<'a> StreamingEngine<'a> {
         }
 
         let tag_end = i;
-        let (open_line, open_col) = line_col_at(self.input, tag_start);
+
+        if is_empty_element && elem_prefix.is_none() && attrs.is_empty() {
+            if self.out.is_some() {
+                let depth = self.stack.len();
+                if !parent_preserve
+                    && !parent_inline
+                    && depth > 0
+                    && !self.write_indent(depth, tag_start)
+                {
+                    return false;
+                }
+                if !self.write_bytes(b"<", tag_start)
+                    || !self.write_bytes(raw_name, tag_start)
+                    || !self.write_bytes(b"/>", tag_start)
+                {
+                    return false;
+                }
+                if !parent_preserve && !parent_inline && !self.write_bytes(b"\n", tag_start) {
+                    return false;
+                }
+            }
+            self.seen_root = true;
+            self.pos = tag_end;
+            if self.stack.is_empty() {
+                self.root_closed = true;
+            }
+            return true;
+        }
+
         let inherited_default_ns = self
             .stack
             .last()
@@ -2542,8 +2680,8 @@ impl<'a> StreamingEngine<'a> {
         let mut frame = XmlFrame {
             raw_name,
             open_offset: tag_start,
-            open_line,
-            open_col,
+            open_line: 0,
+            open_col: 0,
             default_ns: inherited_default_ns,
             ns_bindings: Vec::new(),
             ns_map: None,
@@ -2554,90 +2692,98 @@ impl<'a> StreamingEngine<'a> {
         };
 
         // Pass 1 over buffered attributes: apply xmlns / xmlns:prefix bindings and xml:space
-        for attr in &attrs {
-            if attr.raw_name == b"xmlns" {
-                let uri = resolve_attr_value(attr.raw_value);
-                if uri.as_ref() == XML_NS_URI || uri.as_ref() == XMLNS_NS_URI {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        "default namespace cannot be bound to the reserved 'xml' or 'xmlns' namespace URI",
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                frame.default_ns = uri;
-            } else if attr.prefix == Some(b"xmlns") {
-                let prefix = attr.local_name;
-                let uri = resolve_attr_value(attr.raw_value);
-                if prefix == b"xmlns" {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        "prefix 'xmlns' is reserved and must not be declared",
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                if uri.is_empty() {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        format!(
-                            "namespace prefix '{}' cannot be bound to an empty URI in Namespaces in XML 1.0",
-                            String::from_utf8_lossy(prefix)
-                        ),
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                if prefix == b"xml" && uri.as_ref() != XML_NS_URI {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        "prefix 'xml' may only be bound to 'http://www.w3.org/XML/1998/namespace'",
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                if prefix != b"xml" && uri.as_ref() == XML_NS_URI {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        "only the 'xml' prefix may be bound to 'http://www.w3.org/XML/1998/namespace'",
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                if uri.as_ref() == XMLNS_NS_URI {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidNamespaceDeclaration,
-                        "no prefix may be bound to 'http://www.w3.org/2000/xmlns/'",
-                        attr.name_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
-                }
-                frame.insert_ns_binding(prefix, uri);
-            } else if attr.raw_name == b"xml:space" {
-                let val = resolve_attr_value(attr.raw_value);
-                if val.as_ref() == b"preserve" {
-                    frame.xml_space_preserve = true;
-                    frame.inline_mode = true;
-                } else if val.as_ref() == b"default" {
-                    frame.xml_space_preserve = false;
-                    frame.inline_mode = false;
+        let mut has_prefixed_non_xmlns_attr = false;
+        if !attrs.is_empty() {
+            for attr in attrs.iter() {
+                if attr.raw_name == b"xmlns" {
+                    let uri = resolve_attr_value(attr.raw_value);
+                    if uri.as_ref() == XML_NS_URI || uri.as_ref() == XMLNS_NS_URI {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            "default namespace cannot be bound to the reserved 'xml' or 'xmlns' namespace URI",
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    frame.default_ns = uri;
+                } else if attr.prefix == Some(b"xmlns") {
+                    let prefix = attr.local_name;
+                    let uri = resolve_attr_value(attr.raw_value);
+                    if prefix == b"xmlns" {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            "prefix 'xmlns' is reserved and must not be declared",
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    if uri.is_empty() {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            format!(
+                                "namespace prefix '{}' cannot be bound to an empty URI in Namespaces in XML 1.0",
+                                String::from_utf8_lossy(prefix)
+                            ),
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    if prefix == b"xml" && uri.as_ref() != XML_NS_URI {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            "prefix 'xml' may only be bound to 'http://www.w3.org/XML/1998/namespace'",
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    if prefix != b"xml" && uri.as_ref() == XML_NS_URI {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            "only the 'xml' prefix may be bound to 'http://www.w3.org/XML/1998/namespace'",
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    if uri.as_ref() == XMLNS_NS_URI {
+                        self.emit_span_error(
+                            XmlErrorKind::InvalidNamespaceDeclaration,
+                            "no prefix may be bound to 'http://www.w3.org/2000/xmlns/'",
+                            attr.name_offset,
+                            attr.value_offset + attr.raw_value.len(),
+                        );
+                        return false;
+                    }
+                    frame.insert_ns_binding(prefix, uri);
                 } else {
-                    self.emit_span_error(
-                        XmlErrorKind::InvalidXmlSpace,
-                        format!(
-                            "invalid xml:space value '{}'; must be \"default\" or \"preserve\"",
-                            String::from_utf8_lossy(&val)
-                        ),
-                        attr.value_offset,
-                        attr.value_offset + attr.raw_value.len(),
-                    );
-                    return false;
+                    if attr.prefix.is_some() {
+                        has_prefixed_non_xmlns_attr = true;
+                    }
+                    if attr.raw_name == b"xml:space" {
+                        let val = resolve_attr_value(attr.raw_value);
+                        if val.as_ref() == b"preserve" {
+                            frame.xml_space_preserve = true;
+                            frame.inline_mode = true;
+                        } else if val.as_ref() == b"default" {
+                            frame.xml_space_preserve = false;
+                            frame.inline_mode = false;
+                        } else {
+                            self.emit_span_error(
+                                XmlErrorKind::InvalidXmlSpace,
+                                format!(
+                                    "invalid xml:space value '{}'; must be \"default\" or \"preserve\"",
+                                    String::from_utf8_lossy(&val)
+                                ),
+                                attr.value_offset,
+                                attr.value_offset + attr.raw_value.len(),
+                            );
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -2660,41 +2806,43 @@ impl<'a> StreamingEngine<'a> {
         }
 
         // Pass 2 over buffered attributes: validate prefixed attribute bindings & expanded {uri}local uniqueness
-        self.expanded_attr_set.clear();
-        for attr in &attrs {
-            if attr.raw_name == b"xmlns" || attr.prefix == Some(b"xmlns") {
-                continue;
-            }
-            if let Some(ap) = attr.prefix {
-                let Some(uri) = self.lookup_prefix(ap, &frame) else {
-                    self.emit_span_error(
-                        XmlErrorKind::UndeclaredPrefix,
-                        format!(
-                            "undeclared namespace prefix '{}' on attribute '{}'",
-                            String::from_utf8_lossy(ap),
-                            String::from_utf8_lossy(attr.raw_name)
-                        ),
-                        attr.name_offset,
-                        attr.name_offset + attr.raw_name.len(),
-                    );
-                    return false;
-                };
-                if !self
-                    .expanded_attr_set
-                    .insert((uri.clone(), attr.local_name))
-                {
-                    self.emit_span_error(
-                        XmlErrorKind::DuplicateExpandedAttribute,
-                        format!(
-                            "expanded attribute '{{{}}}{}' is duplicated on element '<{}>'",
-                            String::from_utf8_lossy(&uri),
-                            String::from_utf8_lossy(attr.local_name),
-                            String::from_utf8_lossy(raw_name)
-                        ),
-                        attr.name_offset,
-                        attr.name_offset + attr.raw_name.len(),
-                    );
-                    return false;
+        if has_prefixed_non_xmlns_attr {
+            self.expanded_attr_set.clear();
+            for attr in attrs.iter() {
+                if attr.raw_name == b"xmlns" || attr.prefix == Some(b"xmlns") {
+                    continue;
+                }
+                if let Some(ap) = attr.prefix {
+                    let Some(uri) = self.lookup_prefix(ap, &frame).cloned() else {
+                        self.emit_span_error(
+                            XmlErrorKind::UndeclaredPrefix,
+                            format!(
+                                "undeclared namespace prefix '{}' on attribute '{}'",
+                                String::from_utf8_lossy(ap),
+                                String::from_utf8_lossy(attr.raw_name)
+                            ),
+                            attr.name_offset,
+                            attr.name_offset + attr.raw_name.len(),
+                        );
+                        return false;
+                    };
+                    if !self
+                        .expanded_attr_set
+                        .insert((uri.clone(), attr.local_name))
+                    {
+                        self.emit_span_error(
+                            XmlErrorKind::DuplicateExpandedAttribute,
+                            format!(
+                                "expanded attribute '{{{}}}{}' is duplicated on element '<{}>'",
+                                String::from_utf8_lossy(&uri),
+                                String::from_utf8_lossy(attr.local_name),
+                                String::from_utf8_lossy(raw_name)
+                            ),
+                            attr.name_offset,
+                            attr.name_offset + attr.raw_name.len(),
+                        );
+                        return false;
+                    }
                 }
             }
         }
@@ -2724,7 +2872,7 @@ impl<'a> StreamingEngine<'a> {
             if self.config.sort_attributes && attrs.len() > 1 {
                 attrs.sort_unstable_by(|a, b| a.raw_name.cmp(b.raw_name));
             }
-            for attr in &attrs {
+            for attr in attrs.iter() {
                 let q = [attr.quote];
                 if !self.write_bytes(b" ", attr.name_offset)
                     || !self.write_bytes(attr.raw_name, attr.name_offset)
@@ -2805,14 +2953,19 @@ impl<'a> StreamingEngine<'a> {
         };
 
         if frame.raw_name != raw_name {
+            let (open_line, open_col) = if frame.open_line > 0 {
+                (frame.open_line, frame.open_col)
+            } else {
+                self.line_cursor.line_col_at(self.input, frame.open_offset)
+            };
             self.emit_span_error(
                 XmlErrorKind::MismatchedClosingTag,
                 format!(
                     "mismatched closing tag '</{}>'; expected '</{}>' (opened at {}:{})",
                     String::from_utf8_lossy(raw_name),
                     String::from_utf8_lossy(frame.raw_name),
-                    frame.open_line,
-                    frame.open_col
+                    open_line,
+                    open_col
                 ),
                 tag_start,
                 tag_end,
@@ -2988,16 +3141,16 @@ impl<'a> StreamingEngine<'a> {
         &'b self,
         prefix: &[u8],
         current_frame: &'b XmlFrame<'a>,
-    ) -> Option<Cow<'a, [u8]>> {
+    ) -> Option<&'b Cow<'a, [u8]>> {
         if prefix == b"xml" {
-            return Some(Cow::Borrowed(XML_NS_URI));
+            return Some(&XML_NS_COW);
         }
         if let Some(uri) = current_frame.get_ns_binding(prefix) {
-            return Some(uri.clone());
+            return Some(uri);
         }
         for frame in self.stack.iter().rev() {
             if let Some(uri) = frame.get_ns_binding(prefix) {
-                return Some(uri.clone());
+                return Some(uri);
             }
         }
         None
