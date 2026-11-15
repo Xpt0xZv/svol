@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.79.0"
 description = "Zero-dependency, single-pass streaming XML 1.0 (Fifth Edition) + Namespaces in XML 1.0 linter, formatter, and LSP server"
+readme = "README.md"
+repository = "https://github.com/Xpt0xZv/svol"
+homepage = "https://github.com/Xpt0xZv/svol"
+documentation = "https://docs.rs/svol"
 license = "MIT OR Apache-2.0"
-exclude = ["fuzz", ".github", ".idea"]
+keywords = ["xml", "linter", "formatter", "lsp", "parser"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "parser-implementations",
+    "text-processing",
+]
+exclude = ["fuzz", ".github", ".idea", ".agents"]
 
 [workspace]
 exclude = ["fuzz"]
