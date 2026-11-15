@@ -25,6 +25,8 @@ fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 dist/
+dist-wheels/
+release-assets/
 build/
 *.egg-info/
 *.whl

@@ -41,6 +41,23 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 
 /// Configuration for the single-pass XML 1.0 + Namespaces 1.0 engine.
+///
+/// # Examples
+///
+/// ```
+/// use svol::{format_xml, Config, DEFAULT_INDENT_WIDTH, DEFAULT_LINE_WIDTH};
+///
+/// let config = Config {
+///     sort_attributes: true,
+///     disallow_doctype: true,
+///     ..Config::default()
+/// };
+/// assert_eq!(config.indent_width, DEFAULT_INDENT_WIDTH);
+/// assert_eq!(config.line_width, DEFAULT_LINE_WIDTH);
+///
+/// let formatted = format_xml(br#"<item b="2" a="1"/>"#, &config).unwrap();
+/// assert_eq!(formatted, b"<item a=\"1\" b=\"2\"/>\n");
+/// ```
 #[derive(Debug, Clone)]
 pub struct Config {
     pub indent_width: usize,
@@ -72,6 +89,19 @@ impl Default for Config {
 
 /// Validates `input` in a single streaming pass without constructing a DOM.
 /// Returns an empty `Vec` if the XML document is well-formed and namespace-well-formed.
+///
+/// # Examples
+///
+/// ```
+/// use svol::{lint_xml, Config, XmlErrorKind};
+///
+/// let cfg = Config::default();
+/// assert!(lint_xml(b"<root><child/></root>", &cfg).is_empty());
+///
+/// let errs = lint_xml(b"<root><mismatched></other></root>", &cfg);
+/// assert_eq!(errs.len(), 1);
+/// assert_eq!(errs[0].kind, XmlErrorKind::MismatchedClosingTag);
+/// ```
 pub fn lint_xml(input: &[u8], config: &Config) -> Vec<XmlError> {
     let engine = StreamingEngine::new(input, config, false);
     let (diagnostics, _) = engine.run();
@@ -80,6 +110,24 @@ pub fn lint_xml(input: &[u8], config: &Config) -> Vec<XmlError> {
 
 /// Validates and formats `input` in a single streaming pass without constructing a DOM.
 /// Returns the formatted UTF-8 byte buffer or a list of diagnostics if ill-formed.
+///
+/// # Examples
+///
+/// ```
+/// use svol::{format_xml, Config};
+///
+/// let cfg = Config {
+///     sort_attributes: true,
+///     ..Config::default()
+/// };
+/// let formatted = format_xml(br#"<root z="2" a="1"><child>hi</child></root>"#, &cfg).unwrap();
+/// assert_eq!(
+///     std::str::from_utf8(&formatted).unwrap(),
+///     "<root a=\"1\" z=\"2\">\n  <child>hi</child>\n</root>\n"
+/// );
+///
+/// assert!(format_xml(b"<root>", &cfg).is_err());
+/// ```
 pub fn format_xml(input: &[u8], config: &Config) -> Result<Vec<u8>, Vec<XmlError>> {
     let engine = StreamingEngine::new(input, config, true);
     let (diagnostics, output) = engine.run();
@@ -92,6 +140,17 @@ pub fn format_xml(input: &[u8], config: &Config) -> Result<Vec<u8>, Vec<XmlError
 
 /// Returns `true` if `path` has a supported XML family extension
 /// (`.xml`, `.xsd`, `.xsl`, `.xslt`, `.svg`, `.plist`, `.xhtml`, `.csproj`, `.pom`).
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use svol::is_supported_xml_path;
+///
+/// assert!(is_supported_xml_path(Path::new("pom.xml")));
+/// assert!(is_supported_xml_path(Path::new("icons/LOGO.SVG")));
+/// assert!(!is_supported_xml_path(Path::new("README.md")));
+/// ```
 pub fn is_supported_xml_path(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;

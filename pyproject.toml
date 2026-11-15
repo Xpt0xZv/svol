@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "svol"
 version = "0.1.0"
 description = "Zero-dependency, single-pass streaming XML 1.0 (Fifth Edition) + Namespaces in XML 1.0 linter, formatter, and LSP server"
+readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.8"
 dependencies = []
@@ -22,8 +23,20 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: XML",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Xpt0xZv/svol"
+Repository = "https://github.com/Xpt0xZv/svol"
+Documentation = "https://github.com/Xpt0xZv/svol#readme"
+Changelog = "https://github.com/Xpt0xZv/svol/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Xpt0xZv/svol/issues"
+
 [tool.maturin]
 bindings = "bin"
 manifest-path = "Cargo.toml"
 strip = true
 locked = true
+include = [
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+    { path = "CHANGELOG.md", format = "sdist" },
+]
