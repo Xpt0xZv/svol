@@ -1,0 +1,63 @@
+name: Feature Request
+description: Propose a capability or ergonomic improvement that preserves svol's zero-dependency streaming architecture
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for proposing an improvement to `svol`! Please keep in mind `svol`'s core architectural invariants documented in [`CONTRIBUTING.md`](https://github.com/Xpt0xZv/svol/blob/main/CONTRIBUTING.md) and [`SECURITY.md`](https://github.com/Xpt0xZv/svol/blob/main/SECURITY.md):
+        - **Zero external dependencies** (`std` only in `Cargo.toml`; `dependencies = []` in `pyproject.toml`).
+        - **No `build.rs` scripts**.
+        - **Single-pass bounded-memory streaming** (`StreamingEngine` with explicit heap stack and hard resource caps).
+        - **MSRV `1.79.0` compatibility**.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature Area
+      description: Which area of `svol` does this proposal target?
+      options:
+        - CLI Flags / Ergonomics (`src/main.rs`)
+        - XML 1.0 / Namespaces Validation Rules (`src/lexer.rs`, `src/lib.rs`)
+        - XML Formatting Options (`src/lib.rs`)
+        - Language Server Protocol (`src/lsp.rs`)
+        - Diagnostics / Output Formats (`src/error.rs`)
+        - Documentation / Editor Integrations
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / Motivation
+      description: What workflow or problem are you trying to solve?
+      placeholder: "When formatting XML files in CI, I would like..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the desired CLI flag, API, diagnostic rule, or LSP behavior in detail.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered any workarounds or alternative designs?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Architectural & Supply-Chain Alignment
+      options:
+        - label: This feature can be implemented using only the Rust standard library (`std`) with zero external crates and no `build.rs`.
+          required: true
+        - label: This feature preserves single-pass bounded-memory streaming and MSRV `1.79.0` compatibility.
+          required: true

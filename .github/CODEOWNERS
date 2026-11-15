@@ -1,0 +1,16 @@
+# Default owner for all files in the repository
+*                   @Xpt0xZv
+
+# CI/CD workflows, Dependabot, issue/PR templates, and repository governance
+/.github/           @Xpt0xZv
+
+# Security policy and private vulnerability disclosure rules
+/SECURITY.md        @Xpt0xZv
+
+# Supply-chain & dependency manifests (strict zero-dependency invariant)
+/Cargo.toml         @Xpt0xZv
+/Cargo.lock         @Xpt0xZv
+/pyproject.toml     @Xpt0xZv
+
+# Audited SIMD unsafe boundary & core streaming XML lexer
+/src/lexer.rs       @Xpt0xZv

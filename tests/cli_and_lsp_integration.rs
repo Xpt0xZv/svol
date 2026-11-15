@@ -321,6 +321,21 @@ fn test_lsp_stdio_json_rpc_round_trip() {
         fmt_resp.contains(r#""newText":"<root a=\"1\" z=\"2\">\n  <child>ok</child>\n</root>\n""#)
     );
 
+    // 5b. textDocument/didOpen with already-formatted XML -> formatting returns result:[]
+    write_lsp_frame(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/clean.xml","languageId":"xml","version":1,"text":"<root>\n  <child>ok</child>\n</root>\n"}}}"#,
+    );
+    let clean_diag = read_lsp_frame(&mut reader).expect("publishDiagnostics for clean doc");
+    assert!(clean_diag.contains(r#""diagnostics":[]"#));
+
+    write_lsp_frame(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":22,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///workspace/clean.xml"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+    );
+    let clean_fmt_resp = read_lsp_frame(&mut reader).expect("formatting response for clean doc");
+    assert!(clean_fmt_resp.contains(r#"{"jsonrpc":"2.0","id":22,"result":[]}"#));
+
     // 6. shutdown
     write_lsp_frame(
         &mut stdin,
@@ -336,4 +351,61 @@ fn test_lsp_stdio_json_rpc_round_trip() {
 
     let status = child.wait().expect("wait for lsp exit");
     assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn test_cli_fmt_write_skips_already_formatted_and_single_root_walk() {
+    let dir = TempDir::new("fmt_noop_walk");
+    let clean_path = dir.join("clean.xml");
+    fs::write(&clean_path, b"<root>\n  <child>ok</child>\n</root>\n").unwrap();
+
+    // Make clean.xml read-only: if fmt --write attempted atomic_replace_file, it would fail with PermissionDenied
+    let mut perms = fs::metadata(&clean_path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&clean_path, perms.clone()).unwrap();
+
+    let res = run_svol(&["fmt", "--write", clean_path.to_str().unwrap()], None);
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "fmt --write on already-formatted read-only file must skip rewrite: stderr={}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    // Restore write permission for TempDir cleanup
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(&clean_path, perms);
+    }
+
+    // Single-root directory walk skips .git/target and processes supported XML files
+    let git_dir = dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(git_dir.join("broken.xml"), b"<unclosed>").unwrap();
+
+    let sub_dir = dir.join("sub");
+    fs::create_dir_all(&sub_dir).unwrap();
+    let dirty_path = sub_dir.join("dirty.xml");
+    fs::write(&dirty_path, b"<r b=\"2\" a=\"1\"><c/></r>").unwrap();
+
+    let walk_res = run_svol(
+        &[
+            "fmt",
+            "--write",
+            "--sort-attributes",
+            dir.path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(
+        walk_res.status.code(),
+        Some(0),
+        "single-root fmt --write must ignore .git/broken.xml and format dirty.xml: stderr={}",
+        String::from_utf8_lossy(&walk_res.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&dirty_path).unwrap(),
+        "<r a=\"1\" b=\"2\">\n  <c/>\n</r>\n"
+    );
 }

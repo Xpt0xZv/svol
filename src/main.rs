@@ -1,5 +1,8 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,8 +13,9 @@ use std::thread;
 use svol::error::{push_json_escaped, sanitize_for_terminal, XmlError};
 use svol::lsp::run_lsp_server;
 use svol::{
-    atomic_replace_file, format_xml, is_supported_xml_path, lint_xml, read_file_bounded, Config,
-    DEFAULT_INDENT_WIDTH, DEFAULT_LINE_WIDTH, DEFAULT_MAX_INPUT_BYTES, SUPPORTED_EXTENSIONS,
+    atomic_replace_file, format_xml, format_xml_with_scratch, is_supported_xml_path, lint_xml,
+    lint_xml_with_scratch, read_file_bounded_into, Config, EngineScratch, DEFAULT_INDENT_WIDTH,
+    DEFAULT_LINE_WIDTH, DEFAULT_MAX_INPUT_BYTES, SUPPORTED_EXTENSIONS,
 };
 
 /// Maximum directory recursion depth for the non-recursive directory walker.
@@ -451,6 +455,7 @@ fn discover_and_deduplicate_files(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<Strin
     let mut discovered = Vec::new();
     let mut seen = HashSet::new();
     let mut errors = Vec::new();
+    let need_dedup = roots.len() > 1;
 
     for root in roots {
         let meta = match fs::symlink_metadata(root) {
@@ -471,7 +476,7 @@ fn discover_and_deduplicate_files(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<Strin
 
         if meta.is_file() {
             // Explicitly specified regular file on CLI is accepted regardless of extension
-            try_insert_unique_file(root.clone(), &mut seen, &mut discovered);
+            try_insert_unique_file(root.clone(), &mut seen, &mut discovered, need_dedup);
             continue;
         }
 
@@ -503,17 +508,38 @@ fn discover_and_deduplicate_files(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<Strin
                 }
             };
 
-            let mut entries: Vec<PathBuf> = Vec::new();
+            let mut entries: Vec<(PathBuf, bool)> = Vec::new();
             for entry_res in read_dir {
-                match entry_res {
-                    Ok(entry) => entries.push(entry.path()),
-                    Err(e) => errors.push(format!("{}: {}", dir.display(), e)),
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(e) => {
+                        errors.push(format!("{}: {}", dir.display(), e));
+                        continue;
+                    }
+                };
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(e) => {
+                        errors.push(format!("{}: {}", entry.path().display(), e));
+                        continue;
+                    }
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                if ft.is_dir() {
+                    if !should_skip_dir_name(&file_name) {
+                        entries.push((entry.path(), true));
+                    }
+                } else if ft.is_file() && is_supported_xml_path(Path::new(&file_name)) {
+                    entries.push((entry.path(), false));
                 }
             }
             // Sort descending so LIFO stack visits entries in deterministic ascending order
-            entries.sort_unstable_by(|a, b| b.cmp(a));
+            entries.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
 
-            for path in entries {
+            for (path, is_dir) in entries {
                 if discovered.len() >= MAX_DISCOVERED_FILES {
                     errors.push(format!(
                         "maximum discovered file limit ({}) reached",
@@ -522,24 +548,10 @@ fn discover_and_deduplicate_files(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<Strin
                     return (discovered, errors);
                 }
 
-                let entry_meta = match fs::symlink_metadata(&path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        errors.push(format!("{}: {}", path.display(), e));
-                        continue;
-                    }
-                };
-
-                if entry_meta.file_type().is_symlink() {
-                    continue;
-                }
-
-                if entry_meta.is_dir() {
-                    if !should_skip_directory(&path) {
-                        stack.push((path, depth + 1));
-                    }
-                } else if entry_meta.is_file() && is_supported_xml_path(&path) {
-                    try_insert_unique_file(path, &mut seen, &mut discovered);
+                if is_dir {
+                    stack.push((path, depth + 1));
+                } else {
+                    try_insert_unique_file(path, &mut seen, &mut discovered, need_dedup);
                 }
             }
         }
@@ -548,8 +560,8 @@ fn discover_and_deduplicate_files(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<Strin
     (discovered, errors)
 }
 
-fn should_skip_directory(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+fn should_skip_dir_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
         return false;
     };
     matches!(
@@ -562,10 +574,29 @@ fn try_insert_unique_file(
     path: PathBuf,
     seen: &mut HashSet<PathBuf>,
     discovered: &mut Vec<PathBuf>,
+    need_dedup: bool,
 ) {
+    if !need_dedup {
+        discovered.push(path);
+        return;
+    }
     let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
     if seen.insert(key) {
         discovered.push(path);
+    }
+}
+
+struct WorkerScratch {
+    input_buf: Vec<u8>,
+    engine: EngineScratch,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            input_buf: Vec::new(),
+            engine: EngineScratch::new(),
+        }
     }
 }
 
@@ -579,7 +610,11 @@ struct FileProcessResult {
 /// Runs `process_single_file` across a bounded `std::thread::scope` worker pool.
 fn run_worker_pool(files: &[PathBuf], opts: &CliOptions) -> Vec<FileProcessResult> {
     if files.len() == 1 || opts.threads <= 1 {
-        return files.iter().map(|p| process_single_file(p, opts)).collect();
+        let mut scratch = WorkerScratch::new();
+        return files
+            .iter()
+            .map(|p| process_single_file(p, opts, &mut scratch))
+            .collect();
     }
 
     let worker_count = opts.threads.min(files.len()).clamp(1, 64);
@@ -593,12 +628,13 @@ fn run_worker_pool(files: &[PathBuf], opts: &CliOptions) -> Vec<FileProcessResul
             let next_ref = &next_idx;
             handles.push(s.spawn(move || {
                 let mut local = Vec::new();
+                let mut scratch = WorkerScratch::new();
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= files.len() {
                         break;
                     }
-                    let res = process_single_file(&files[idx], opts);
+                    let res = process_single_file(&files[idx], opts, &mut scratch);
                     local.push((idx, res));
                 }
                 local
@@ -617,25 +653,27 @@ fn run_worker_pool(files: &[PathBuf], opts: &CliOptions) -> Vec<FileProcessResul
     indexed.into_iter().map(|(_, r)| r).collect()
 }
 
-fn process_single_file(path: &Path, opts: &CliOptions) -> FileProcessResult {
+fn process_single_file(
+    path: &Path,
+    opts: &CliOptions,
+    scratch: &mut WorkerScratch,
+) -> FileProcessResult {
     let display_path = path.to_string_lossy().into_owned();
     let max_in = opts.config.max_input_bytes.min(DEFAULT_MAX_INPUT_BYTES);
 
-    let bytes = match read_file_bounded(path, max_in) {
-        Ok(b) => b,
-        Err(err) => {
-            return FileProcessResult {
-                display_path,
-                diagnostics: vec![err],
-                check_failed: false,
-                stdout_output: None,
-            };
-        }
-    };
+    if let Err(err) = read_file_bounded_into(path, max_in, &mut scratch.input_buf) {
+        return FileProcessResult {
+            display_path,
+            diagnostics: vec![err],
+            check_failed: false,
+            stdout_output: None,
+        };
+    }
 
     match opts.mode {
         Mode::Lint => {
-            let diagnostics = lint_xml(&bytes, &opts.config);
+            let diagnostics =
+                lint_xml_with_scratch(&scratch.input_buf, &opts.config, &mut scratch.engine);
             FileProcessResult {
                 display_path,
                 diagnostics,
@@ -643,60 +681,66 @@ fn process_single_file(path: &Path, opts: &CliOptions) -> FileProcessResult {
                 stdout_output: None,
             }
         }
-        Mode::FormatStdout => match format_xml(&bytes, &opts.config) {
-            Ok(formatted) => FileProcessResult {
-                display_path,
-                diagnostics: Vec::new(),
-                check_failed: false,
-                stdout_output: Some(formatted),
-            },
-            Err(diagnostics) => FileProcessResult {
-                display_path,
-                diagnostics,
-                check_failed: false,
-                stdout_output: None,
-            },
-        },
-        Mode::FormatCheck => match format_xml(&bytes, &opts.config) {
-            Ok(formatted) => FileProcessResult {
-                display_path,
-                diagnostics: Vec::new(),
-                check_failed: formatted != bytes,
-                stdout_output: None,
-            },
-            Err(diagnostics) => FileProcessResult {
-                display_path,
-                diagnostics,
-                check_failed: false,
-                stdout_output: None,
-            },
-        },
-        Mode::FormatWrite => match format_xml(&bytes, &opts.config) {
-            Ok(formatted) => {
-                if formatted != bytes {
-                    if let Err(io_err) = atomic_replace_file(path, &formatted) {
-                        return FileProcessResult {
-                            display_path,
-                            diagnostics: vec![XmlError::io(&io_err)],
-                            check_failed: false,
-                            stdout_output: None,
-                        };
-                    }
-                }
-                FileProcessResult {
+        Mode::FormatStdout => {
+            match format_xml_with_scratch(&scratch.input_buf, &opts.config, &mut scratch.engine) {
+                Ok(formatted) => FileProcessResult {
                     display_path,
                     diagnostics: Vec::new(),
                     check_failed: false,
+                    stdout_output: Some(formatted.to_vec()),
+                },
+                Err(diagnostics) => FileProcessResult {
+                    display_path,
+                    diagnostics,
+                    check_failed: false,
                     stdout_output: None,
-                }
+                },
             }
-            Err(diagnostics) => FileProcessResult {
-                display_path,
-                diagnostics,
-                check_failed: false,
-                stdout_output: None,
-            },
-        },
+        }
+        Mode::FormatCheck => {
+            match format_xml_with_scratch(&scratch.input_buf, &opts.config, &mut scratch.engine) {
+                Ok(formatted) => FileProcessResult {
+                    display_path,
+                    diagnostics: Vec::new(),
+                    check_failed: formatted != scratch.input_buf.as_slice(),
+                    stdout_output: None,
+                },
+                Err(diagnostics) => FileProcessResult {
+                    display_path,
+                    diagnostics,
+                    check_failed: false,
+                    stdout_output: None,
+                },
+            }
+        }
+        Mode::FormatWrite => {
+            match format_xml_with_scratch(&scratch.input_buf, &opts.config, &mut scratch.engine) {
+                Ok(formatted) => {
+                    if formatted != scratch.input_buf.as_slice() {
+                        if let Err(io_err) = atomic_replace_file(path, formatted) {
+                            return FileProcessResult {
+                                display_path,
+                                diagnostics: vec![XmlError::io(&io_err)],
+                                check_failed: false,
+                                stdout_output: None,
+                            };
+                        }
+                    }
+                    FileProcessResult {
+                        display_path,
+                        diagnostics: Vec::new(),
+                        check_failed: false,
+                        stdout_output: None,
+                    }
+                }
+                Err(diagnostics) => FileProcessResult {
+                    display_path,
+                    diagnostics,
+                    check_failed: false,
+                    stdout_output: None,
+                },
+            }
+        }
         Mode::Lsp => FileProcessResult {
             display_path,
             diagnostics: Vec::new(),
@@ -762,6 +806,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses OS temp_dir, directory walker, canonicalize, and atomic_replace_file syscalls unsupported under Miri isolation"
+    )]
     fn test_directory_walker_dedup_and_atomic_write() {
         let tmp_dir = env::temp_dir().join(format!("svol_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);

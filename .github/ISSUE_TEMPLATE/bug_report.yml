@@ -1,0 +1,85 @@
+name: Bug Report
+description: Report a non-security bug in the svol XML linter, formatter, CLI, or LSP server
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Security Notice**: Do **NOT** report security vulnerabilities (such as crashes/panics on untrusted input, DoS/OOM, XXE/entity bypasses, symlink/TOCTOU issues, or LSP framing bypasses) in a public issue. Please report them privately via [GitHub Security Advisories](https://github.com/Xpt0xZv/svol/security/advisories/new) per [`SECURITY.md`](https://github.com/Xpt0xZv/svol/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: security-confirm
+    attributes:
+      label: Security Disclosure Confirmation
+      description: Confirm that this report does not disclose an exploitable security vulnerability.
+      options:
+        - label: I confirm this is a non-security bug report (or I have already reported any security issue privately).
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which subsystem of `svol` is affected?
+      options:
+        - CLI (`svol check` / `svol fmt`)
+        - XML 1.0 + Namespaces Parser / Lexer (`src/lexer.rs`, `src/lib.rs`)
+        - Formatter (`src/lib.rs`)
+        - Language Server (`svol lsp` / `src/lsp.rs`)
+        - Diagnostics / JSON Output (`src/error.rs`)
+        - Packaging / Release Binaries / Python Wheel
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: svol Version
+      description: Output of `svol --version` or commit SHA.
+      placeholder: "svol 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Operating System & Architecture
+      description: OS version, CPU architecture, and Rust toolchain version (if built from source).
+      placeholder: "Ubuntu 24.04 (x86_64), rustc 1.79.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description & Reproduction Steps
+      description: Provide a clear description of the bug and exact steps or CLI invocation to reproduce it.
+      placeholder: |
+        1. Create `sample.xml` with the XML snippet below.
+        2. Run `svol check --strict sample.xml`.
+        3. Observe unexpected diagnostic...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal Reproducer Input
+      description: Minimal XML payload or LSP JSON-RPC frame that triggers the issue.
+      render: xml
+      placeholder: |
+        <?xml version="1.0" encoding="UTF-8"?>
+        <root xmlns="urn:example">
+          <item attr="value"/>
+        </root>
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: What did you expect `svol` to do, and what actually happened (include exact stdout/stderr and exit code)?
+    validations:
+      required: true

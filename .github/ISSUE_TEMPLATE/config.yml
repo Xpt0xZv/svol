@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a Security Vulnerability (Private Disclosure)
+    url: https://github.com/Xpt0xZv/svol/security/advisories/new
+    about: Please do NOT file a public issue for security vulnerabilities, crashes, DoS/OOM, XXE, or parser bypasses. Report them privately via GitHub Security Advisories.
