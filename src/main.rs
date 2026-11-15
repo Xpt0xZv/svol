@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -762,6 +764,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses OS temp_dir, directory walker, canonicalize, and atomic_replace_file syscalls unsupported under Miri isolation"
+    )]
     fn test_directory_walker_dedup_and_atomic_write() {
         let tmp_dir = env::temp_dir().join(format!("svol_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);

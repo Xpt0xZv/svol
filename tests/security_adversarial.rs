@@ -1,16 +1,18 @@
 use std::env;
 use std::fs;
 use std::io::Cursor;
+#[cfg(not(miri))]
 use std::time::Instant;
 
 use svol::error::{
     byte_offset_to_utf16_line_col, is_unsafe_terminal_char, sanitize_for_terminal,
     utf16_position_to_byte_offset, XmlErrorKind,
 };
+use svol::lexer::{skip_xml_attr_bytes_swar, skip_xml_text_bytes_swar};
 use svol::lsp::{read_lsp_frame, LspServer};
 use svol::{
-    atomic_replace_file, format_xml, lint_xml, read_file_bounded, BoundedVecRefSink, Config,
-    KeySet, MAX_DEPTH,
+    atomic_replace_file, format_xml, lint_xml, read_file_bounded, skip_xml_attr_bytes,
+    skip_xml_text_bytes, BoundedVecRefSink, Config, KeySet, MAX_DEPTH,
 };
 
 #[test]
@@ -158,10 +160,13 @@ fn test_cwe407_attribute_and_namespace_hashdos() {
     }
     ns_xml.push_str("/>");
 
+    #[cfg(not(miri))]
     let start = Instant::now();
     let errs = lint_xml(ns_xml.as_bytes(), &cfg);
+    #[cfg(not(miri))]
     let elapsed = start.elapsed();
     assert!(errs.is_empty(), "expected 2k ns attrs to pass: {:?}", errs);
+    #[cfg(not(miri))]
     assert!(
         elapsed.as_millis() < 100,
         "2,000 xmlns + 2,000 prefixed attributes took {:?} (>= 100 ms)",
@@ -314,6 +319,138 @@ fn test_cwe20_smuggled_control_chars_and_ruling2_del_c1() {
 }
 
 #[test]
+fn test_cwe20_cwe436_exhaustive_256_byte_simd_swar_differential_parity() {
+    let cfg = Config::default();
+
+    // 1. Exhaustive 256-byte (0x00..=0xFF) fast-scanner differential parity between active SIMD
+    //    path (`skip_xml_text_bytes` / `skip_xml_attr_bytes`) and portable SWAR fallback across all
+    //    alignments 0..=40 for >= 40-byte slices (guaranteeing AVX2 32-byte and NEON 16-byte loops).
+    let mut buf = [b'a'; 81];
+    for byte in 0u8..=255 {
+        for offset in 0..=40 {
+            buf.fill(b'a');
+            buf[offset] = byte;
+            let slice = &buf[..offset + 41];
+
+            assert_eq!(
+                skip_xml_text_bytes(slice),
+                skip_xml_text_bytes_swar(slice),
+                "text scanner parity mismatch for byte 0x{:02X} at offset {}",
+                byte,
+                offset
+            );
+
+            for quote in [b'"', b'\''] {
+                assert_eq!(
+                    skip_xml_attr_bytes(slice, quote),
+                    skip_xml_attr_bytes_swar(slice, quote),
+                    "attr scanner (quote={:?}) parity mismatch for byte 0x{:02X} at offset {}",
+                    quote as char,
+                    byte,
+                    offset
+                );
+            }
+        }
+    }
+
+    // 2. End-to-end XML lint_xml differential parity across all 256 single-byte values (0x00..=0xFF)
+    //    comparing short (< 32-byte SWAR) vs >= 40-byte (SIMD) inputs across SIMD/SWAR alignments.
+    let alignments = [0usize, 1, 7, 8, 15, 16, 31, 32, 39];
+    for byte in 0u8..=255 {
+        // Skip ASCII syntax delimiters whose following payload changes grammar structure in short vs long docs;
+        // their stop-byte parity is already exhaustively verified above.
+        let text_comparable = !matches!(byte, b'<' | b'&');
+        let attr_comparable = !matches!(byte, b'<' | b'&' | b'"');
+
+        if text_comparable {
+            let short_doc = [b'<', b'r', b'>', byte, b'<', b'/', b'r', b'>'];
+            let short_kinds: Vec<XmlErrorKind> = lint_xml(&short_doc, &cfg)
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+
+            for &pad_len in &alignments {
+                let mut long_doc = Vec::with_capacity(pad_len + 48);
+                long_doc.extend_from_slice(b"<r>");
+                long_doc.resize(long_doc.len() + pad_len, b'a');
+                long_doc.push(byte);
+                long_doc.resize(long_doc.len() + 40, b'a');
+                long_doc.extend_from_slice(b"</r>");
+
+                let long_kinds: Vec<XmlErrorKind> = lint_xml(&long_doc, &cfg)
+                    .into_iter()
+                    .map(|e| e.kind)
+                    .collect();
+                assert_eq!(
+                    long_kinds, short_kinds,
+                    "lint_xml text parity mismatch for byte 0x{:02X} at pad_len={}",
+                    byte, pad_len
+                );
+            }
+        }
+
+        if attr_comparable {
+            let short_attr = [b'<', b'r', b' ', b'a', b'=', b'"', byte, b'"', b'/', b'>'];
+            let short_kinds: Vec<XmlErrorKind> = lint_xml(&short_attr, &cfg)
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+
+            for &pad_len in &alignments {
+                let mut long_attr = Vec::with_capacity(pad_len + 52);
+                long_attr.extend_from_slice(b"<r a=\"");
+                long_attr.resize(long_attr.len() + pad_len, b'a');
+                long_attr.push(byte);
+                long_attr.resize(long_attr.len() + 40, b'a');
+                long_attr.extend_from_slice(b"\"/>");
+
+                let long_kinds: Vec<XmlErrorKind> = lint_xml(&long_attr, &cfg)
+                    .into_iter()
+                    .map(|e| e.kind)
+                    .collect();
+                assert_eq!(
+                    long_kinds, short_kinds,
+                    "lint_xml attr parity mismatch for byte 0x{:02X} at pad_len={}",
+                    byte, pad_len
+                );
+            }
+        }
+    }
+
+    // 3. Explicit Finding 1 regression check for 0x1F (Unit Separator) across every offset 0..40
+    //    in both lint_xml and format_xml for text and attribute values.
+    for offset in 0..40 {
+        let mut text_doc = Vec::with_capacity(offset + 48);
+        text_doc.extend_from_slice(b"<r>");
+        text_doc.resize(text_doc.len() + offset, b'a');
+        text_doc.push(0x1F);
+        text_doc.resize(text_doc.len() + 40, b'a');
+        text_doc.extend_from_slice(b"</r>");
+
+        let lint_errs = lint_xml(&text_doc, &cfg);
+        assert_eq!(lint_errs.len(), 1);
+        assert_eq!(lint_errs[0].kind, XmlErrorKind::InvalidChar);
+        let fmt_errs = format_xml(&text_doc, &cfg).expect_err("0x1F in text must fail format_xml");
+        assert_eq!(fmt_errs.len(), 1);
+        assert_eq!(fmt_errs[0].kind, XmlErrorKind::InvalidChar);
+
+        let mut attr_doc = Vec::with_capacity(offset + 52);
+        attr_doc.extend_from_slice(b"<r a=\"");
+        attr_doc.resize(attr_doc.len() + offset, b'a');
+        attr_doc.push(0x1F);
+        attr_doc.resize(attr_doc.len() + 40, b'a');
+        attr_doc.extend_from_slice(b"\"/>");
+
+        let lint_errs = lint_xml(&attr_doc, &cfg);
+        assert_eq!(lint_errs.len(), 1);
+        assert_eq!(lint_errs[0].kind, XmlErrorKind::InvalidChar);
+        let fmt_errs = format_xml(&attr_doc, &cfg).expect_err("0x1F in attr must fail format_xml");
+        assert_eq!(fmt_errs.len(), 1);
+        assert_eq!(fmt_errs[0].kind, XmlErrorKind::InvalidChar);
+    }
+}
+
+#[test]
 fn test_cwe150_cwe451_terminal_escape_and_trojan_source() {
     let raw = "alert\x1b[31m\x07\x7f\u{009B}\u{202E}\u{2066}\u{200B}\u{FEFF}end";
     let sanitized = sanitize_for_terminal(raw);
@@ -433,6 +570,10 @@ fn test_cwe444_cwe125_lsp_framing_and_utf16_desync() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "uses OS temp_dir, permissions, and symlink syscalls unsupported under Miri isolation"
+)]
 fn test_cwe59_cwe367_filesystem_symlink_and_fifo_traps() {
     let tmp_dir = env::temp_dir().join(format!("svol_sec_fs_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp_dir);

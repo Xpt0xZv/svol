@@ -327,13 +327,15 @@ pub fn skip_xml_text_bytes(bytes: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 availability verified via runtime feature detection.
+            // SAFETY: CPU support for AVX2 was just verified via `is_x86_feature_detected!("avx2")`,
+            // satisfying the `#[target_feature(enable = "avx2")]` precondition.
             return unsafe { skip_xml_text_bytes_avx2(bytes) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        // SAFETY: NEON is baseline on aarch64.
+        // SAFETY: `#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]` guarantees
+        // NEON/ASIMD support at compile time on this target.
         return unsafe { skip_xml_text_bytes_neon(bytes) };
     }
     #[allow(unreachable_code)]
@@ -348,13 +350,15 @@ pub fn skip_xml_attr_bytes(bytes: &[u8], quote: u8) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 availability verified via runtime feature detection.
+            // SAFETY: CPU support for AVX2 was just verified via `is_x86_feature_detected!("avx2")`,
+            // satisfying the `#[target_feature(enable = "avx2")]` precondition.
             return unsafe { skip_xml_attr_bytes_avx2(bytes, quote) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        // SAFETY: NEON is baseline on aarch64.
+        // SAFETY: `#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]` guarantees
+        // NEON/ASIMD support at compile time on this target.
         return unsafe { skip_xml_attr_bytes_neon(bytes, quote) };
     }
     #[allow(unreachable_code)]
@@ -458,37 +462,43 @@ unsafe fn skip_xml_text_bytes_avx2(bytes: &[u8]) -> usize {
     let len = bytes.len();
     let ptr = bytes.as_ptr();
 
-    let v_lt = _mm256_set1_epi8(b'<' as i8);
-    let v_amp = _mm256_set1_epi8(b'&' as i8);
-    let v_rb = _mm256_set1_epi8(b']' as i8);
-    let v_del = _mm256_set1_epi8(0x7F);
-    let v_tab = _mm256_set1_epi8(b'\t' as i8);
-    let v_lf = _mm256_set1_epi8(b'\n' as i8);
-    let v_space_m1 = _mm256_set1_epi8(0x1F);
+    // SAFETY: Caller guarantees CPU AVX2 availability (via `is_x86_feature_detected!("avx2")`),
+    // satisfying the `#[target_feature(enable = "avx2")]` requirement for AVX2 intrinsics.
+    // The loop condition `i + 32 <= len` ensures `ptr.add(i)` and the 32-byte unaligned load
+    // `_mm256_loadu_si256` always read strictly within `bytes`.
+    unsafe {
+        let v_lt = _mm256_set1_epi8(b'<' as i8);
+        let v_amp = _mm256_set1_epi8(b'&' as i8);
+        let v_rb = _mm256_set1_epi8(b']' as i8);
+        let v_del = _mm256_set1_epi8(0x7F);
+        let v_tab = _mm256_set1_epi8(b'\t' as i8);
+        let v_lf = _mm256_set1_epi8(b'\n' as i8);
+        let v_space = _mm256_set1_epi8(0x20);
 
-    while i + 32 <= len {
-        let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-        // Any byte < 0 (i.e. >= 0x80 in unsigned) or <= 0x1F
-        let is_ctrl_or_high = _mm256_cmpgt_epi8(v_space_m1, chunk);
-        let is_tab = _mm256_cmpeq_epi8(chunk, v_tab);
-        let is_lf = _mm256_cmpeq_epi8(chunk, v_lf);
-        let allowed_ws = _mm256_or_si256(is_tab, is_lf);
-        let bad_ctrl_or_high = _mm256_andnot_si256(allowed_ws, is_ctrl_or_high);
+        while i + 32 <= len {
+            let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+            // Signed `0x20 > chunk` matches `0x00..=0x1F` (0..=31) and `0x80..=0xFF` (-128..=-1)
+            let is_ctrl_or_high = _mm256_cmpgt_epi8(v_space, chunk);
+            let is_tab = _mm256_cmpeq_epi8(chunk, v_tab);
+            let is_lf = _mm256_cmpeq_epi8(chunk, v_lf);
+            let allowed_ws = _mm256_or_si256(is_tab, is_lf);
+            let bad_ctrl_or_high = _mm256_andnot_si256(allowed_ws, is_ctrl_or_high);
 
-        let is_lt = _mm256_cmpeq_epi8(chunk, v_lt);
-        let is_amp = _mm256_cmpeq_epi8(chunk, v_amp);
-        let is_rb = _mm256_cmpeq_epi8(chunk, v_rb);
-        let is_del = _mm256_cmpeq_epi8(chunk, v_del);
+            let is_lt = _mm256_cmpeq_epi8(chunk, v_lt);
+            let is_amp = _mm256_cmpeq_epi8(chunk, v_amp);
+            let is_rb = _mm256_cmpeq_epi8(chunk, v_rb);
+            let is_del = _mm256_cmpeq_epi8(chunk, v_del);
 
-        let stop_vec = _mm256_or_si256(
-            _mm256_or_si256(bad_ctrl_or_high, is_lt),
-            _mm256_or_si256(_mm256_or_si256(is_amp, is_rb), is_del),
-        );
-        let mask = _mm256_movemask_epi8(stop_vec) as u32;
-        if mask != 0 {
-            return i + mask.trailing_zeros() as usize;
+            let stop_vec = _mm256_or_si256(
+                _mm256_or_si256(bad_ctrl_or_high, is_lt),
+                _mm256_or_si256(_mm256_or_si256(is_amp, is_rb), is_del),
+            );
+            let mask = _mm256_movemask_epi8(stop_vec) as u32;
+            if mask != 0 {
+                return i + mask.trailing_zeros() as usize;
+            }
+            i += 32;
         }
-        i += 32;
     }
     i + skip_xml_text_bytes_swar(&bytes[i..])
 }
@@ -501,110 +511,127 @@ unsafe fn skip_xml_attr_bytes_avx2(bytes: &[u8], quote: u8) -> usize {
     let len = bytes.len();
     let ptr = bytes.as_ptr();
 
-    let v_quote = _mm256_set1_epi8(quote as i8);
-    let v_lt = _mm256_set1_epi8(b'<' as i8);
-    let v_amp = _mm256_set1_epi8(b'&' as i8);
-    let v_del = _mm256_set1_epi8(0x7F);
-    let v_space_m1 = _mm256_set1_epi8(0x1F);
+    // SAFETY: Caller guarantees CPU AVX2 availability (via `is_x86_feature_detected!("avx2")`),
+    // satisfying the `#[target_feature(enable = "avx2")]` requirement for AVX2 intrinsics.
+    // The loop condition `i + 32 <= len` ensures `ptr.add(i)` and the 32-byte unaligned load
+    // `_mm256_loadu_si256` always read strictly within `bytes`.
+    unsafe {
+        let v_quote = _mm256_set1_epi8(quote as i8);
+        let v_lt = _mm256_set1_epi8(b'<' as i8);
+        let v_amp = _mm256_set1_epi8(b'&' as i8);
+        let v_del = _mm256_set1_epi8(0x7F);
+        let v_space = _mm256_set1_epi8(0x20);
 
-    while i + 32 <= len {
-        let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-        let is_ctrl_or_high = _mm256_cmpgt_epi8(v_space_m1, chunk);
-        let is_quote = _mm256_cmpeq_epi8(chunk, v_quote);
-        let is_lt = _mm256_cmpeq_epi8(chunk, v_lt);
-        let is_amp = _mm256_cmpeq_epi8(chunk, v_amp);
-        let is_del = _mm256_cmpeq_epi8(chunk, v_del);
+        while i + 32 <= len {
+            let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+            // Signed `0x20 > chunk` matches `0x00..=0x1F` (0..=31) and `0x80..=0xFF` (-128..=-1)
+            let is_ctrl_or_high = _mm256_cmpgt_epi8(v_space, chunk);
+            let is_quote = _mm256_cmpeq_epi8(chunk, v_quote);
+            let is_lt = _mm256_cmpeq_epi8(chunk, v_lt);
+            let is_amp = _mm256_cmpeq_epi8(chunk, v_amp);
+            let is_del = _mm256_cmpeq_epi8(chunk, v_del);
 
-        let stop_vec = _mm256_or_si256(
-            _mm256_or_si256(is_ctrl_or_high, is_quote),
-            _mm256_or_si256(_mm256_or_si256(is_lt, is_amp), is_del),
-        );
-        let mask = _mm256_movemask_epi8(stop_vec) as u32;
-        if mask != 0 {
-            return i + mask.trailing_zeros() as usize;
+            let stop_vec = _mm256_or_si256(
+                _mm256_or_si256(is_ctrl_or_high, is_quote),
+                _mm256_or_si256(_mm256_or_si256(is_lt, is_amp), is_del),
+            );
+            let mask = _mm256_movemask_epi8(stop_vec) as u32;
+            if mask != 0 {
+                return i + mask.trailing_zeros() as usize;
+            }
+            i += 32;
         }
-        i += 32;
     }
     i + skip_xml_attr_bytes_swar(&bytes[i..], quote)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 unsafe fn skip_xml_text_bytes_neon(bytes: &[u8]) -> usize {
     use std::arch::aarch64::*;
     let mut i = 0;
     let len = bytes.len();
     let ptr = bytes.as_ptr();
 
-    let v_lt = vdupq_n_u8(b'<');
-    let v_amp = vdupq_n_u8(b'&');
-    let v_rb = vdupq_n_u8(b']');
-    let v_tab = vdupq_n_u8(b'\t');
-    let v_lf = vdupq_n_u8(b'\n');
-    let v_space = vdupq_n_u8(0x20);
-    let v_high = vdupq_n_u8(0x7F);
+    // SAFETY: Caller guarantees `aarch64` with `neon` target feature enabled.
+    // The loop condition `i + 16 <= len` ensures `ptr.add(i)` and the 16-byte `vld1q_u8`
+    // load always read strictly within `bytes`.
+    unsafe {
+        let v_lt = vdupq_n_u8(b'<');
+        let v_amp = vdupq_n_u8(b'&');
+        let v_rb = vdupq_n_u8(b']');
+        let v_tab = vdupq_n_u8(b'\t');
+        let v_lf = vdupq_n_u8(b'\n');
+        let v_space = vdupq_n_u8(0x20);
+        let v_high = vdupq_n_u8(0x7F);
 
-    while i + 16 <= len {
-        let chunk = vld1q_u8(ptr.add(i));
-        let is_ctrl = vcltq_u8(chunk, v_space);
-        let is_high = vcgeq_u8(chunk, v_high);
-        let is_tab = vceqq_u8(chunk, v_tab);
-        let is_lf = vceqq_u8(chunk, v_lf);
-        let allowed_ws = vorrq_u8(is_tab, is_lf);
-        let bad_ctrl = vbicq_u8(is_ctrl, allowed_ws);
+        while i + 16 <= len {
+            let chunk = vld1q_u8(ptr.add(i));
+            let is_ctrl = vcltq_u8(chunk, v_space);
+            let is_high = vcgeq_u8(chunk, v_high);
+            let is_tab = vceqq_u8(chunk, v_tab);
+            let is_lf = vceqq_u8(chunk, v_lf);
+            let allowed_ws = vorrq_u8(is_tab, is_lf);
+            let bad_ctrl = vbicq_u8(is_ctrl, allowed_ws);
 
-        let is_lt = vceqq_u8(chunk, v_lt);
-        let is_amp = vceqq_u8(chunk, v_amp);
-        let is_rb = vceqq_u8(chunk, v_rb);
+            let is_lt = vceqq_u8(chunk, v_lt);
+            let is_amp = vceqq_u8(chunk, v_amp);
+            let is_rb = vceqq_u8(chunk, v_rb);
 
-        let stop = vorrq_u8(
-            vorrq_u8(bad_ctrl, is_high),
-            vorrq_u8(vorrq_u8(is_lt, is_amp), is_rb),
-        );
-        if vmaxvq_u8(stop) != 0 {
-            for j in 0..16 {
-                if !is_fast_text_byte(bytes[i + j]) {
-                    return i + j;
+            let stop = vorrq_u8(
+                vorrq_u8(bad_ctrl, is_high),
+                vorrq_u8(vorrq_u8(is_lt, is_amp), is_rb),
+            );
+            if vmaxvq_u8(stop) != 0 {
+                for j in 0..16 {
+                    if !is_fast_text_byte(bytes[i + j]) {
+                        return i + j;
+                    }
                 }
             }
+            i += 16;
         }
-        i += 16;
     }
     i + skip_xml_text_bytes_swar(&bytes[i..])
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 unsafe fn skip_xml_attr_bytes_neon(bytes: &[u8], quote: u8) -> usize {
     use std::arch::aarch64::*;
     let mut i = 0;
     let len = bytes.len();
     let ptr = bytes.as_ptr();
 
-    let v_quote = vdupq_n_u8(quote);
-    let v_lt = vdupq_n_u8(b'<');
-    let v_amp = vdupq_n_u8(b'&');
-    let v_space = vdupq_n_u8(0x20);
-    let v_high = vdupq_n_u8(0x7F);
+    // SAFETY: Caller guarantees `aarch64` with `neon` target feature enabled.
+    // The loop condition `i + 16 <= len` ensures `ptr.add(i)` and the 16-byte `vld1q_u8`
+    // load always read strictly within `bytes`.
+    unsafe {
+        let v_quote = vdupq_n_u8(quote);
+        let v_lt = vdupq_n_u8(b'<');
+        let v_amp = vdupq_n_u8(b'&');
+        let v_space = vdupq_n_u8(0x20);
+        let v_high = vdupq_n_u8(0x7F);
 
-    while i + 16 <= len {
-        let chunk = vld1q_u8(ptr.add(i));
-        let is_ctrl = vcltq_u8(chunk, v_space);
-        let is_high = vcgeq_u8(chunk, v_high);
-        let is_quote = vceqq_u8(chunk, v_quote);
-        let is_lt = vceqq_u8(chunk, v_lt);
-        let is_amp = vceqq_u8(chunk, v_amp);
+        while i + 16 <= len {
+            let chunk = vld1q_u8(ptr.add(i));
+            let is_ctrl = vcltq_u8(chunk, v_space);
+            let is_high = vcgeq_u8(chunk, v_high);
+            let is_quote = vceqq_u8(chunk, v_quote);
+            let is_lt = vceqq_u8(chunk, v_lt);
+            let is_amp = vceqq_u8(chunk, v_amp);
 
-        let stop = vorrq_u8(
-            vorrq_u8(is_ctrl, is_high),
-            vorrq_u8(vorrq_u8(is_quote, is_lt), is_amp),
-        );
-        if vmaxvq_u8(stop) != 0 {
-            for j in 0..16 {
-                if !is_fast_attr_byte(bytes[i + j], quote) {
-                    return i + j;
+            let stop = vorrq_u8(
+                vorrq_u8(is_ctrl, is_high),
+                vorrq_u8(vorrq_u8(is_quote, is_lt), is_amp),
+            );
+            if vmaxvq_u8(stop) != 0 {
+                for j in 0..16 {
+                    if !is_fast_attr_byte(bytes[i + j], quote) {
+                        return i + j;
+                    }
                 }
             }
+            i += 16;
         }
-        i += 16;
     }
     i + skip_xml_attr_bytes_swar(&bytes[i..], quote)
 }
