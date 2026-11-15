@@ -187,7 +187,7 @@ jobs:
           persist-credentials: false
 
       - name: Build wheel with maturin
-        uses: PyO3/maturin-action@5f8a1b3b0aad13193f46c9131f9b9e663def8ce5 # v1.46.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -215,7 +215,7 @@ jobs:
           persist-credentials: false
 
       - name: Build sdist with maturin
-        uses: PyO3/maturin-action@5f8a1b3b0aad13193f46c9131f9b9e663def8ce5 # v1.46.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist-wheels
