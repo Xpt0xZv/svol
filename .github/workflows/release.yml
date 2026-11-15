@@ -7,6 +7,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,6 +18,7 @@ jobs:
   verify-release-gate:
     name: Pre-Release Supply-Chain & Version Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -52,6 +57,7 @@ jobs:
     name: Build Release Binary (${{ matrix.target }})
     needs: verify-release-gate
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -143,6 +149,7 @@ jobs:
     name: Build Python Wheels (${{ matrix.target }})
     needs: verify-release-gate
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -198,6 +205,7 @@ jobs:
     name: Build Python Source Distribution
     needs: verify-release-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -223,6 +231,7 @@ jobs:
     name: Attest SLSA Provenance & Publish GitHub Release
     needs: [build-binaries]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
@@ -263,6 +272,7 @@ jobs:
     name: Publish to PyPI (Trusted Publisher OIDC)
     needs: [build-wheels, build-sdist, github-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/svol
@@ -287,6 +297,7 @@ jobs:
     name: Publish to crates.io (Trusted Publisher OIDC)
     needs: [github-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: crates-io
       url: https://crates.io/crates/svol

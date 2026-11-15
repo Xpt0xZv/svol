@@ -7,6 +7,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -15,6 +19,7 @@ jobs:
   supply-chain-hygiene:
     name: Supply-Chain & Hygiene Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -75,10 +80,30 @@ jobs:
       - name: Lint with Clippy (cargo clippy)
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: low
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-1.0, AGPL-3.0, LGPL-2.1, LGPL-3.0
+
   test-matrix:
     name: Test (${{ matrix.os }})
     needs: supply-chain-hygiene
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     permissions:
       contents: read
     strategy:
@@ -110,6 +135,7 @@ jobs:
     name: MSRV Check (Rust 1.79.0)
     needs: supply-chain-hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -126,10 +152,35 @@ jobs:
       - name: Check & test with MSRV 1.79.0
         run: cargo test --locked --all-targets
 
+  miri:
+    name: Miri Undefined Behavior Sanitizer
+    needs: supply-chain-hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly toolchain with Miri
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+
+      - name: Run Miri Undefined Behavior Sanitizer
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance"
+        run: cargo +nightly miri test --locked --lib --bins --test security_adversarial
+
   maturin-smoke:
     name: Maturin Wheel Smoke Test
     needs: supply-chain-hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
